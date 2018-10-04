@@ -449,30 +449,6 @@ class RequestReceiver:
 
         return next(self.current_chunk)
 
-    def recv_until_body_depreciated(self):
-        last_four = collections.deque(maxlen=4)
-        for b in self:
-            last_four.append(b)
-
-            if bytes(last_four) == b'\r\n\r\n':
-                error_log.debug('Received request headers.')
-                break
-        else:
-            raise PeerError(msg='HTTP request has no trailing CR-LF-CR-LF',
-                            code='REQUEST_HAS_NO_END')
-
-
-# noinspection PyUnusedLocal
-def handle_connection_depreciated(sock, address):
-    request_receiver = RequestReceiver(sock)
-
-    request = ws.http.parser.parse(request_receiver)
-
-    return ws.serve.serve_file_depreciated(
-        sock,
-        request.request_line.request_target.path
-    )
-
 
 def handle_request(request):
     file_path = request.request_line.request_target.path
