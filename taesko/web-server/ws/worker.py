@@ -6,7 +6,6 @@ import ws.http.parser
 import ws.http.structs
 import ws.http.utils
 import ws.ratelimit
-import ws.responses
 import ws.serve
 import ws.sockets
 from ws.config import config
@@ -121,7 +120,7 @@ class Worker:
         if not response:
             error_log.exception('Could not handle exception. Client will '
                                 'receive a 500 Internal Server Error.')
-            response = ws.responses.build_response(500)
+            response = ws.http.utils.build_response(500)
 
         response.headers['Connection'] = 'close'
 
@@ -212,7 +211,7 @@ class Worker:
         # No salvation if bytes have already been sent over the socket
         assert not self.responding
 
-        response = ws.responses.service_unavailable
+        response = ws.http.utils.build_response(503)
         response.headers['Connection'] = 'close'
         self.sock.send_all(bytes(response))
 
@@ -226,22 +225,22 @@ class Worker:
 @err_handler(AssertionError)
 def server_err_handler(exc):
     error_log.exception('Internal server error.')
-    return ws.responses.build_response(500)
+    return ws.http.utils.build_response(500)
 
 
 @err_handler(ws.http.parser.ParserError)
 def handle_parse_err(exc):
     error_log.info('Parsing error with code=%s occurred', exc.code)
-    return ws.responses.build_response(400)
+    return ws.http.utils.build_response(400)
 
 
 @err_handler(ws.sockets.ClientSocketError)
 def handle_client_socket_err(exc):
     error_log.info('Client socket error with code=%s occurred', exc.code)
     if exc.code in ('CS_PEER_SEND_IS_TOO_SLOW', 'CS_CONNECTION_TIMED_OUT'):
-        return ws.responses.build_response(408)
+        return ws.http.utils.build_response(408)
     else:
-        return ws.responses.build_response(400)
+        return ws.http.utils.build_response(400)
 
 
 def work(client_socket, address, quick_reply_with=None):
@@ -287,4 +286,4 @@ def handle_request(request):
     elif request.request_line.method == 'DELETE':
         return ws.serve.delete_file(route)
     else:
-        return ws.responses.method_not_allowed
+        return ws.http.utils.build_response(405)

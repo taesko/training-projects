@@ -6,6 +6,9 @@ from ws.err import *
 from ws.http.structs import HTTPResponse, HTTPStatusLine, HTTPHeaders
 from ws.logs import error_log
 
+error_log.warning('This module is depreciated. See ws.http.utils for building '
+                  'of responses and ws.err for error handling.')
+
 
 def build_response(status_code, *, body=None, reason_phrase='', headers=None,
                    version='HTTP/1.1'):
