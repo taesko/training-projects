@@ -1,3 +1,6 @@
+import errno
+import select
+
 import ws.auth
 import ws.cworker
 import ws.http.utils as hutils
@@ -17,6 +20,7 @@ class Worker:
         assert isinstance(fd_transport, ws.sockets.FDTransport)
         assert isinstance(parent_ctx, collections.Mapping)
 
+        self.connection_workers = {}
         self.connections = collections.deque()
         self.request_stats = collections.defaultdict(lambda: {'total': 0,
                                                               'count': 0})
@@ -38,14 +42,26 @@ class Worker:
             self.ssl_ctx = None
 
     def recv_new_sockets(self):
-        error_log.debug3('Receiving new sockets through fd transport.')
+        """ Receives new sockets from the parent process.
 
+        This function RAISES the following exceptions:
+        ws.sockets.TimeoutException - when the parent process takes to long to
+            send a socket's file descriptor (can happen because he is
+            blocked or because there are no clients connecting atm.)
+        OSError - when a problem occurs with the underling UNIX socket. This is
+            not a recoverable state and there is no guarantee that subsequent
+            calls won't fail as well.
+        """
+        error_log.debug3('Receiving new sockets through fd transport.')
         msg, fds = self.fd_transport.recv_fds()
+        connections = []
 
         for fd in fds:
             error_log.debug3('Received file descriptor %s', fd)
             sock = ws.sockets.Socket(fileno=fd)
-            self.connections.append((sock, sock.getpeername()))
+            connections.append((sock, sock.getpeername()))
+
+        return connections
 
     def work(self):
         error_log.info('Entering endless loop of processing sockets.')
@@ -53,10 +69,42 @@ class Worker:
         while True:
             sock, address = (None, None)
 
+            connected_sockets = tuple(s[0] for s in self.connections)
+            rlist = connected_sockets + (self.fd_transport,)
+            wlist = connected_sockets
+            xlist = []  # TODO wat ?
+            # have select block indefinitely because our only purpose is to
+            # work... forever...
+            rlist, wlist, xlist = select.select(rlist=rlist, wlist=wlist,
+                                                xlist=xlist, timeout=None)
+            rset, wset = frozenset(rlist), frozenset(wlist)
+            if self.fd_transport in rset:
+                try:
+                    new_connections = self.recv_new_sockets()
+                except ws.sockets.TimeoutException:
+                    error_log.warning('No sockets received.')
+                    new_connections = []
+                except OSError as err:
+                    if err.errno == errno.EWOULDBLOCK:
+                        new_connections = []
+                    else:
+                        raise
+                for sock, address in new_connections:
+                    conn_worker = self.handle_connection(socket=sock,
+                                                         address=address)
+                    self.connection_workers[sock] = conn_worker
+
+            leftover_conn_workers = {}
+            for sock, conn_worker in self.connection_workers.items():
+                conn_worker.work(can_read=sock in rset,
+                                 can_write=sock in wset)
+                if conn_worker.state != conn_worker.States.finished:
+                    leftover_conn_workers[sock] = conn_worker
+                    self.connections.remove(sock)
+                    sock.close(pass_silently=True)
+
             # noinspection PyBroadException
             try:
-                if not self.connections:
-                    self.recv_new_sockets()
 
                 sock, address = self.connections.popleft()
                 self.handle_connection(socket=sock, address=address)

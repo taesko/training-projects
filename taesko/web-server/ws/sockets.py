@@ -105,6 +105,7 @@ class ServerSocket(Socket):
 
 class FDTransport:
     def __init__(self, sender_timeout=None, receiver_timeout=None):
+        # TODO create and use this as a non-blocking pair.
         pair = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sender, self.receiver = pair
         if sender_timeout:
@@ -130,6 +131,14 @@ class FDTransport:
             self.sender.close()
 
         self._mode = val
+
+    def fileno(self):
+        assert self._mode is not None
+        socks = {
+            'sender': self.sender,
+            'receiver': self.receiver
+        }
+        return socks[self._mode].fileno()
 
     def send_fds(self, msg, fds):
         assert self._mode == 'sender'
