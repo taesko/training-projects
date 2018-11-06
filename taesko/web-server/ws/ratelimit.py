@@ -4,7 +4,6 @@ import time
 from ws.config import config
 from ws.logs import error_log
 
-RATE_LIMIT_EXIT_CODE_OFFSET_DEPRECIATED = 200
 CONSIDERED_CLIENT_ERRORS = (400,)
 
 ClientConnectionRecord = collections.namedtuple(
@@ -73,6 +72,3 @@ class HTTPRequestRateController:
             )
         else:
             self.bad_connection_records[ip_address]['err_count'] += err_count
-
-
-RequestRateControllerDepreciated = HTTPRequestRateController
