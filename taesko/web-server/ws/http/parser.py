@@ -37,7 +37,7 @@ class ClientSocketException(ParserException):
         super().__init__(msg=msg, code=code)
 
 
-class SocketIterator:
+class SocketIteratorDepreciated:
     """ Optimal byte iterator over plain sockets.
 
     The __next__ method of this class ALWAYS returns one byte from the
@@ -107,52 +107,66 @@ class SocketIterator:
         return next(self.current_chunk)
 
 
-def recv_request(sock,
-                 chunk_size=4096,
-                 timeout=config.getint('http', 'connection_timeout'),
-                 connection_timeout=config.getint('http', 'request_timeout')):
-    error_log.debug3('recv_request() from %s', sock)
-    assert isinstance(sock, ws.sockets.Socket)
-    assert isinstance(chunk_size, int)
+class RequestReceiver:
+    def __init__(
+            self,
+            sock,
+            chunk_size=4096,
+            timeout=config.getint('http', 'request_timeout'),
+            connection_timeout=config.getint('http', 'connection_timeout')
+    ):
+        assert isinstance(sock, ws.sockets.Socket)
+        assert isinstance(chunk_size, int)
+        assert isinstance(timeout, int)
+        assert isinstance(connection_timeout, int)
 
-    total_length = 0
-    chunks = []
-    body_offset = -1
-    start = time.time()
-    sock.settimeout(timeout)
-    while body_offset == -1:
-        if total_length > MAX_HTTP_META_LEN:
+        self.sock = sock
+        self.chunk_size = chunk_size
+        self.timeout = timeout
+        self.connection_timeout = connection_timeout
+        self.start = time.time()
+        self.body_offset = -1
+        self.total_length = 0
+        self.chunks = []
+        self.sock.settimeout(self.timeout)
+
+    def is_finished(self):
+        return self.body_offset != -1
+
+    def do_recv(self):
+        assert not self.is_finished()
+
+        if self.total_length > MAX_HTTP_META_LEN:
             raise ParserException(code='PARSER_REQUEST_TOO_LONG')
-        elif time.time() - start > connection_timeout:
+        elif time.time() - self.start > self.connection_timeout:
             raise ParserException(code='CS_PEER_CONNECTION_TIMED_OUT')
 
         try:
-            chunk = sock.recv(chunk_size)
+            chunk = self.sock.recv(self.chunk_size)
         except ws.sockets.TimeoutException:
             raise ParserException(code='CS_PEER_SEND_IS_TOO_SLOW')
         if not chunk:
             raise ParserException(code='CS_PEER_NOT_SENDING')
-        chunks.append(chunk)
-        total_length += len(chunk)
-        body_offset = chunk.find(b'\r\n\r\n')
+        self.total_length += len(chunk)
+        self.body_offset = chunk.find(b'\r\n\r\n')
+        if self.body_offset != -1:
+            self.body_offset += 4
 
-    lines = []
-    leftover_body = b''
+    def split_lines(self):
+        assert self.is_finished()
+        lines = []
+        leftover_body = b''
+        for i, chunk in enumerate(self.chunks):
+            if i == len(self.chunks) - 1:
+                line_chunk = chunk[:self.body_offset]
+                leftover_body = chunk[self.body_offset:]
+            else:
+                line_chunk = chunk
+            lines.extend(line_chunk.split('\r\n'))
+        return lines, leftover_body
 
-    for i, chunk in enumerate(chunks):
-        if i == len(chunks) - 1:
-            line_chunk = chunk[:body_offset]
-            leftover_body = chunk[body_offset:]
-        else:
-            line_chunk = chunk
-        lines.extend(line_chunk.split(b'\r\n'))
 
-    return lines, leftover_body
-
-
-def parse(sock):
-    lines, leftover_body = recv_request(sock)
-
+def parse(lines):
     try:
         request_line = parse_request_line(lines[0])
         error_log.debug2('Parsed request line %s', request_line)
@@ -165,7 +179,7 @@ def parse(sock):
 
     request = ws.http.structs.HTTPRequest(request_line=request_line,
                                           headers=headers)
-    return request, leftover_body
+    return request
 
 
 HTTP_VERSION_REGEX = re.compile(b'HTTP/(\\d\\.\\d)')
@@ -291,4 +305,3 @@ def parse_headers(lines):
         error_log.debug3('Parsed header field %s with value %r', field, value)
 
     return headers
-

@@ -97,16 +97,6 @@ class Server:
             if not pid:
                 worker.kill_if_hanged()
 
-    def __enter__(self):
-        error_log.depreciate('%s', self.__class__.__enter__.__name__)
-        self.setup()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        error_log.depreciate('%s', self.__class__.__exit__.__name__)
-        self.cleanup()
-        return False
-
     def listen(self):
         assert all(isinstance(w, WorkerProcess)
                    for w in self.workers.values())
@@ -209,6 +199,8 @@ class Server:
                 self.execution_context = self.ExecutionContext.worker
                 ws.signals.reset_handlers(excluding={ws.signals.SIGTERM})
                 ws.signals.signal(ws.signals.SIGCHLD, ws.signals.SIG_IGN)
+                exit_code = 0
+                worker = None
                 # noinspection PyBroadException
                 try:
                     ws.logs.setup_worker_handlers()
@@ -222,9 +214,22 @@ class Server:
                     with profile(WORKER_PROFILING_ON):
                         worker = ws.worker.Worker(fd_transport=fd_transport)
                         exit_code = worker.work()
+                except SignalReceivedException as err:
+                    error_log.info('Exiting from worker due to signal=%s',
+                                   ws.signals.Signals(err.signum).name)
+                except KeyboardInterrupt as err:
+                    error_log.info('Exiting from worker due to '
+                                   'KeyboardInterrupt')
                 except BaseException:
                     error_log.exception('Worker failed.')
                     exit_code = 1
+                finally:
+                    if worker:
+                        # noinspection PyBroadException
+                        try:
+                            worker.cleanup()
+                        except BaseException:
+                            error_log.exception('Cleanup of worker failed.')
 
                 # noinspection PyProtectedMember
                 os._exit(exit_code)

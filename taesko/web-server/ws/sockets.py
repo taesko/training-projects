@@ -104,14 +104,12 @@ class ServerSocket(Socket):
 
 
 class FDTransport:
-    def __init__(self, sender_timeout=None, receiver_timeout=None):
+    def __init__(self, sender_is_blocking=True, receiver_is_blocking=False):
         # TODO create and use this as a non-blocking pair.
         pair = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sender, self.receiver = pair
-        if sender_timeout:
-            self.sender.settimeout(sender_timeout)
-        if receiver_timeout:
-            self.receiver.settimeout(receiver_timeout)
+        self.sender.setblocking(sender_is_blocking)
+        self.receiver.setblocking(receiver_is_blocking)
         self.fixed_msg_len = 50
         self.max_fds = 5
         self._mode = None

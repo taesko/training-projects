@@ -208,6 +208,8 @@ def execute_script(request, socket, body_start=b''):
 
     has_body = 'Content-Length' in request.headers
 
+    # TODO lower level system calls are going to be more convenient because
+    # they will bind the socket to the lifetime of the subprocess as well.
     try:
         proc = subprocess.Popen(
             args=os.path.abspath(cgi_script.script_path),

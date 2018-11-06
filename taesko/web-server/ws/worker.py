@@ -21,7 +21,6 @@ class Worker:
         assert isinstance(parent_ctx, collections.Mapping)
 
         self.connection_workers = {}
-        self.connections = collections.deque()
         self.request_stats = collections.defaultdict(lambda: {'total': 0,
                                                               'count': 0})
         self.parent_ctx = parent_ctx
@@ -53,13 +52,34 @@ class Worker:
             calls won't fail as well.
         """
         error_log.debug3('Receiving new sockets through fd transport.')
-        msg, fds = self.fd_transport.recv_fds()
+        try:
+            msg, fds = self.fd_transport.recv_fds()
+        except OSError as err:
+            if err.errno == errno.EWOULDBLOCK:
+                error_log.warning('No sockets received.')
+                return []
+            else:
+                error_log.exception('fd_transport failed to recv_fds() with '
+                                    'ERRNO=%s and MSG=%s',
+                                    err.errno, err.strerror)
+                return []
+
         connections = []
 
         for fd in fds:
             error_log.debug3('Received file descriptor %s', fd)
             sock = ws.sockets.Socket(fileno=fd)
-            connections.append((sock, sock.getpeername()))
+            try:
+                address = sock.getpeername()
+            except OSError as err:
+                msg = 'getpeername() failed with ERRNO=%s and MSG=%s'
+                error_log.warning(msg, err.errno, err.strerror)
+                continue
+
+            if self.rate_controller.is_banned(ip_address=address[0]):
+                sock.close(pass_silently=True)
+            else:
+                connections.append((sock, address))
 
         return connections
 
@@ -67,75 +87,51 @@ class Worker:
         error_log.info('Entering endless loop of processing sockets.')
 
         while True:
-            sock, address = (None, None)
-
-            connected_sockets = tuple(s[0] for s in self.connections)
+            # TODO connection_workers is a horrible name
+            connected_sockets = tuple(self.connection_workers.keys())
             rlist = connected_sockets + (self.fd_transport,)
             wlist = connected_sockets
             xlist = []  # TODO wat ?
-            # have select block indefinitely because our only purpose is to
-            # work... forever...
-            rlist, wlist, xlist = select.select(rlist=rlist, wlist=wlist,
-                                                xlist=xlist, timeout=None)
+            try:
+                # have select block indefinitely because our only purpose is to
+                # work... forever...
+                rlist, wlist, xlist = select.select(
+                    rlist=rlist, wlist=wlist, xlist=xlist, timeout=None
+                )
+            except OSError as err:
+                error_log.warning('select() failed with ERRNO=%s and MSG=%s',
+                                  err.errno, err.strerror)
+                continue
+
             rset, wset = frozenset(rlist), frozenset(wlist)
             if self.fd_transport in rset:
-                try:
-                    new_connections = self.recv_new_sockets()
-                except ws.sockets.TimeoutException:
-                    error_log.warning('No sockets received.')
-                    new_connections = []
-                except OSError as err:
-                    if err.errno == errno.EWOULDBLOCK:
-                        new_connections = []
-                    else:
-                        raise
+                new_connections = self.recv_new_sockets()
                 for sock, address in new_connections:
+                    conn = (sock, address)
                     conn_worker = self.handle_connection(socket=sock,
                                                          address=address)
-                    self.connection_workers[sock] = conn_worker
+                    self.connection_workers[conn] = conn_worker
 
             leftover_conn_workers = {}
-            for sock, conn_worker in self.connection_workers.items():
-                conn_worker.work(can_read=sock in rset,
-                                 can_write=sock in wset)
-                if conn_worker.state != conn_worker.States.finished:
-                    leftover_conn_workers[sock] = conn_worker
-                    self.connections.remove(sock)
+            for conn, conn_worker in self.connection_workers.items():
+                sock, address = conn
+                conn_worker.work(can_read=sock in rset, can_write=sock in wset)
+                if conn_worker.state == conn_worker.States.finished:
+                    self.rate_controller.record_handled_connection(
+                        ip_address=address[0],
+                        status_codes=conn_worker.status_codes()
+                    )
                     sock.close(pass_silently=True)
-
-            # noinspection PyBroadException
-            try:
-
-                sock, address = self.connections.popleft()
-                self.handle_connection(socket=sock, address=address)
-            except SignalReceivedException as err:
-                if err.signum == ws.signals.SIGTERM:
-                    error_log.info('Breaking work() loop due to signal %s.',
-                                   ws.signals.Signals(err.signum).name)
-                    break
                 else:
-                    error_log.exception('Unknown signal during work() loop')
-            except KeyboardInterrupt:
-                break
-            except Exception:
-                error_log.exception('Exception occurred during work() loop.')
-                continue
-            finally:
-                if sock:
-                    sock.shutdown(ws.sockets.SHUT_RDWR, pass_silently=True)
-                    sock.close(pass_silently=True)
-
-        # noinspection PyUnreachableCode
-        self.cleanup()
-
-        return 0
+                    leftover_conn_workers[conn] = conn_worker
+            self.connection_workers = leftover_conn_workers
 
     def cleanup(self):
         error_log.info('Cleaning up... %s total leftover connections.',
-                       len(self.connections))
+                       len(self.connection_workers))
         self.fd_transport.discard()
 
-        for sock, address in self.connections:
+        for sock, address in self.connection_workers:
             # noinspection PyBroadException
             try:
                 res = hutils.build_response(503)
@@ -153,11 +149,6 @@ class Worker:
         assert isinstance(address, collections.Sequence)
 
         error_log.debug3('handle_connection()')
-
-        if self.rate_controller.is_banned(address[0]):
-            socket.close(pass_silently=True)
-            return
-
         wrapped_sock = socket
 
         if self.ssl_ctx:
@@ -171,25 +162,15 @@ class Worker:
                 error_log.info('Client on %s / %s does not use SSL/TLS',
                                socket, address)
 
-        conn_worker = ws.cworker.ConnectionWorker(
-            sock=wrapped_sock,
-            address=address,
-            auth_scheme=self.auth_scheme,
-            static_files=self.static_files,
-            worker_ctx={'request_stats': self.request_stats}
-        )
-        try:
-            with conn_worker:
-                conn_worker.process_connection(
-                    quick_reply_with=quick_reply_with)
-        finally:
-            self.rate_controller.record_handled_connection(
-                ip_address=address[0],
-                status_codes=conn_worker.status_codes()
-            )
-            for exchange_stats in conn_worker.generate_stats():
-                for stat_name, val in exchange_stats.items():
-                    self.request_stats[stat_name]['total'] += val
-                    self.request_stats[stat_name]['count'] += 1
-            for exchange in conn_worker.exchanges:
-                access_log.log(**exchange)
+        if quick_reply_with:
+            # TODO
+            raise NotImplementedError()
+        # TODO worker_ctx={'request_stats': self.request_stats}
+        # for exchange_stats in conn_worker.generate_stats():
+        #     for stat_name, val in exchange_stats.items():
+        #         self.request_stats[stat_name]['total'] += val
+        #         self.request_stats[stat_name]['count'] += 1
+        return ws.cworker.ConnectionWorker(sock=wrapped_sock, address=address,
+                                           auth_scheme=self.auth_scheme,
+                                           static_files=self.static_files,
+                                           worker_ctx={})
