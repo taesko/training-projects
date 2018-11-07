@@ -115,7 +115,7 @@ class Worker:
             leftover_conn_workers = {}
             for conn, conn_worker in self.connection_workers.items():
                 sock, address = conn
-                conn_worker.work(can_read=sock in rset, can_write=sock in wset)
+                conn_worker.process(can_read=sock in rset, can_write=sock in wset)
                 if conn_worker.state == conn_worker.States.finished:
                     self.rate_controller.record_handled_connection(
                         ip_address=address[0],

@@ -57,20 +57,7 @@ class URI(collections.namedtuple('URI', ['protocol', 'host', 'port',
 class HTTPResponse(collections.namedtuple('HTTPResponse', ['status_line',
                                                            'headers',
                                                            'body'])):
-    def iter_chunks(self, chunk_size=4096):
-        http_fields = io.BytesIO()
-        http_fields.write(bytes(self.status_line))
-        http_fields.write(b'\r\n')
-        http_fields.write(bytes(self.headers))
-        http_fields.write(b'\r\n\r\n')
-
-        http_fields.seek(0)
-        chunk = http_fields.read(chunk_size)
-        while chunk:
-            yield chunk
-            chunk = http_fields.read(chunk_size)
-
-        yield from self.body
+    pass
 
 
 class HTTPStatusLine(

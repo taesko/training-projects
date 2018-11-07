@@ -43,6 +43,14 @@ class SignalReceivedException(ServerException):
         self.signum = signum
 
 
+class StateWouldBlockException(ServerException):
+    pass
+
+
+class BrokenSocketException(ServerException):
+    pass
+
+
 class ExcHandler:
     """ Strategy pattern for handling exceptions.
 

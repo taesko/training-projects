@@ -1,9 +1,10 @@
 import contextlib
-import errno
 import enum
 import resource
 import time
+import io
 
+import ws.profile
 import ws.auth
 import ws.cgi
 import ws.http.parser
@@ -15,153 +16,217 @@ import ws.sockets
 from ws.config import config
 from ws.err import *
 from ws.http.utils import request_is_persistent, response_is_persistent
-from ws.logs import error_log
+from ws.logs import error_log, access_log
 
 CLIENT_ERRORS_THRESHOLD = config.getint('http', 'client_errors_threshold')
 
-exc_handler = ExcHandler()
-
-
-# noinspection PyUnusedLocal
-@exc_handler(AssertionError)
-@exc_handler(ServerException)
-def server_err_handler(exc):
-    error_log.exception('Internal server error.')
-    return ws.http.utils.build_response(500)
-
-
-# noinspection PyUnusedLocal
-@exc_handler(PeerError)
-def peer_err_handler(exc):
-    error_log.warning('PeerError occurred. msg={exc.msg} code={exc.code}'
-                      .format(exc=exc))
-    return ws.http.utils.build_response(400)
-
-
-@exc_handler(ws.http.parser.ParserException)
-def handle_parse_err(exc):
-    error_log.warning('Parsing error with code=%s occurred', exc.code)
-    return ws.http.utils.build_response(400)
-
-
-@exc_handler(ws.http.parser.ClientSocketException)
-def handle_client_socket_err(exc):
-    error_log.warning('Client socket error with code=%s occurred', exc.code)
-    if exc.code in ('CS_PEER_SEND_IS_TOO_SLOW', 'CS_CONNECTION_TIMED_OUT'):
-        return ws.http.utils.build_response(408)
-    elif exc.code == 'CS_PEER_NOT_SENDING':
-        return ws.http.utils.build_response(400)
-    else:
-        return ws.http.utils.build_response(400)
-
 
 class ConnectionWorker:
-    class States(enum.Enum):
-        initial = 1
-        receiving = 2
-        parsing = 4
-        handling = 8
-        responding = 16
-        responded = 32
-        finished = 64
-        error = 128
-
-    def __init__(self, sock, address):
+    def __init__(self, sock, address, *, auth_scheme, static_files,
+                 worker_stats, persist_connection):
         self.sock = sock
         self.address = address
-        self.state = self.States.initial
+        self.finished = False
+        self.persist_connection = persist_connection
+        self.auth_scheme = auth_scheme
+        self.static_files = static_files
+        self.worker_stats = worker_stats
+        self.exchange = None
+        self.push_exchange()
 
-    def work(self, can_read, can_write):
-        pass
+    def push_exchange(self):
+        self.exchange = HTTPExchange(
+            sock=self.sock, address=self.address, auth_scheme=self.auth_scheme,
+            static_files=self.static_files, worker_stats=self.worker_stats,
+            persist_connection=self.persist_connection
+        )
+
+    def work(self, readable_fds, writable_fds, failed_fds):
+        if self.exchange.state == HTTPExchange.States.finished:
+            if self.persist_connection and self.exchange.persisted_connection():
+                self.push_exchange()
+            else:
+                self.finished = True
+                return
+        else:
+            assert isinstance(self.exchange, HTTPExchange)
+            self.exchange.process(readable_fds=readable_fds,
+                                  writable_fds=writable_fds,
+                                  failed_fds=failed_fds)
 
 
 class HTTPExchange:
     class States(enum.Enum):
-        parsing = 1
-        building_response = 2
-        responding = 3
-        finished = 4
-        error = 10
+        parsing_request = 'parsing_request'
+        handling_request = 'handling_request'
+        reading_response = 'reading_response'
+        sending_response = 'sending_response'
+        cleaning = 'cleaning'
+        finished = 'finished'
+        # impossible to send a reply
+        broken = 'broken'
 
     def __init__(self, sock, address, *, auth_scheme, static_files,
-                 worker_stats):
+                 worker_stats, persist_connection):
+        self.sock = sock
+        self.address = address
+        self.required_fds = [self.sock]
+        self.persist_connection = persist_connection
+        self.state = self.States.parsing
+        self.state_machine = {
+            self.States.parsing: self.parse_request,
+            self.States.handling_request: self.handle_request,
+            self.States.reading_response: self.read_response,
+            self.States.sending_response: self.send_response,
+            self.States.cleaning: self.cleanup,
+            self.States.broken: self.handle_broken
+        }
+        self.error = None
+        self.request_profile = ws.profile.Timer()
+        self.request_receiver = ws.http.parser.RequestReceiver(sock=sock)
+        self.request_handler = RequestHandler(
+            sock=sock, address=address, persist_connection=persist_connection,
+            auth_scheme=auth_scheme, static_files=static_files,
+            worker_stats=worker_stats
+        )
+        self.response_reader = ResponseReader(sock=sock)
+        self.response_sender = ResponseSender(sock=sock)
+
+    def process(self, readable_fds, writable_fds, failed_fds):
+        assert self.state != self.States.finished
+
+        while self.state != self.States.finished:
+            method = self.state_machine[self.state]
+            # noinspection PyBroadException
+            try:
+                if self.sock.fileno() in failed_fds:
+                    msg = 'Client through socket {} dropped the TCP connection.'
+                    raise BrokenSocketException(msg=msg.format(self.sock),
+                                                code='BROKEN_CLIENT_SOCKET')
+
+                with self.request_profile.time(self.state.value):
+                    next_state = method(readable_fds=readable_fds,
+                                        writable_fds=writable_fds,
+                                        failed_fds=failed_fds)
+            except StateWouldBlockException as err:
+                error_log.debug3("State %s can't complete due to blocking IO. "
+                                 "Error=%s", err)
+                break
+            except (SignalReceivedException, KeyboardInterrupt):
+                # TODO this drops the client connection without a response.
+                # is this okay ?
+                raise
+            except BaseException as exc_val:
+                if self.state in (self.request_receiver, self.request_handler):
+                    error_log.exception('Unhandled exception while handling '
+                                        'request. HTTPExchange state is %s. '
+                                        'Sending a 500 to client.',
+                                        self.state)
+                    response = ws.http.utils.build_response(500)
+                    self.response_reader.read_from(response)
+                    self.state = self.States.reading_response
+                else:
+                    error_log.exception("HTTP exchange through socket %s "
+                                        "entered a broken state.",
+                                        self.sock)
+                    self.state = self.States.broken
+                    # TODO this might not be ok
+                    self.error = exc_val
+            else:
+                self.state = next_state
+
+    def parse_request(self, readable_fds, writable_fds, failed_fds):
+        assert self.state == self.States.parsing_request
+        assert not self.request_receiver.is_finished()
+
+        if self.sock.fileno() not in readable_fds:
+            raise StateWouldBlockException(msg='Cannot read from socket {}.'
+                                           .format(self.sock),
+                                           code='PARSE_REQ_SOCK_NOT_READABLE')
+        try:
+            while not self.request_receiver.is_finished():
+                self.request_receiver.do_recv()
+        except ws.http.parser.ParserException:
+            error_log.exception('Socket %s failed.')
+            self.response_reader.read_from(ws.http.utils.build_response(400))
+            return self.States.reading_response
+        except BlockingIOError as err:
+            msg = 'No more data in read buffer of socket {}.'
+            raise StateWouldBlockException(msg=msg.format(self.sock),
+                                           code='PARSE_REQ_SOCK_READ_EXH') from err
+
+        lines, leftover_body = self.request_receiver.split_lines()
+        try:
+            request = ws.http.parser.parse(lines=lines)
+        except ws.http.parser.ParserException:
+            self.response_reader.read_from(ws.http.utils.build_response(400))
+            return self.States.reading_response
+        else:
+            self.request_handler.handle_request(request=request,
+                                                leftover_body=leftover_body)
+            return self.States.handling_request
+
+    def handle_request(self, readable_fds, writable_fds, failed_fds):
+        assert self.state == self.States.handling_request
+        response = self.request_handler.process()
+        assert self.request_handler.finished
+        self.response_reader.read_from(response=response)
+        return self.States.reading_response
+
+    def read_response(self, readable_fds, writable_fds, failed_fds):
+        assert self.state == self.States.reading_response
+        # TODO check if fds of response are ready
+        if self.response_reader.finished:
+            return self.States.finalizing
+        else:
+            chunk = self.response_reader.read()
+            self.response_sender.stream_chunk(chunk)
+            return self.States.sending_response
+
+    def send_response(self, readable_fds, writable_fds, failed_fds):
+        assert self.state == self.States.sending_response
+        self.response_sender.send_chunk()
+        if self.response_sender.finished:
+            return self.States.reading_response
+        else:
+            return self.States.sending_response
+
+    def cleanup(self, readable_fds, writable_fds, failed_fds):
+        assert self.state == self.States.cleaning
+        self.response_reader.close()
+        access_log.log(request=self.request_handler.request,
+                       response=self.request_handler.response)
+        return self.States.finished
+
+    def handle_broken(self, readable_fds, writable_fds, failed_fds):
+        return self.States.cleaning
+
+    def persisted_connection(self):
+        return self.request_handler.persisted_connection()
+
+
+class RequestHandler:
+    def __init__(self, sock, address, *,
+                 auth_scheme, worker_stats, static_files, persist_connection):
+        assert isinstance(sock, ws.sockets.Socket)
         self.sock = sock
         self.address = address
         self.request = None
-        self.leftover_body = b''
         self.response = None
-        self.raised_exception = None
-        self.persist_connection = True
-        self.state = self.States.parsing
-        self.state_machine = {
-            self.States.parsing: (self.parse, self.States.building_response),
-            self.States.building_response: (self.build_response,
-                                            self.States.responding),
-            self.States.responding: (self.respond, self.States.finished),
-            self.States.error: (self.handle_error, self.States.error)
-        }
+        self.leftover_body = None
+        self.persist_connection = persist_connection
         self.auth_scheme = auth_scheme
-        self.static_files = static_files
         self.worker_stats = worker_stats
-        self.request_receiver = ws.http.parser.RequestReceiver(sock=sock)
-        self.response_sender = None
+        self.static_files = static_files
+        self.finished = False
 
-    def work(self, can_read, can_write):
-        assert self.state != self.States.finished
+    def handle_request(self, request, leftover_body):
+        assert isinstance(request, ws.http.structs.HTTPRequest)
 
-        method, next_state = self.state_machine[self.state]
-        try:
-            passed = method(can_read=can_read, can_write=can_write)
-        except (SignalReceivedException, KeyboardInterrupt):
-            # TODO this drops the client connection without a response.
-            # is this okay ?
-            raise
-        except BaseException as exc_val:
-            # guard against re-entering error state
-            if self.state == self.States.error:
-                error_log.exception("Error occurred while already in an error "
-                                    "state. This is not recoverable. "
-                                    "Client's connection will be dropped.")
-                self.state = self.States.finished
-            elif self.state == self.States.responding:
-                error_log.warning(
-                    'An exception occurred after worker had sent bytes over '
-                    'the socket(fileno=%s). Client will receive an invalid '
-                    'HTTP response.',
-                    self.sock.fileno()
-                )
-                self.state = self.States.finished
-            else:
-                self.raised_exception = exc_val
-                self.state = self.States.error
-        else:
-            if passed:
-                self.state = next_state
+        self.request = request
+        self.leftover_body = leftover_body
 
-    # noinspection PyUnusedLocal
-    def parse(self, can_read, can_write):
-        assert self.state == self.States.parsing
-        if not can_read:
-            return False
-
-        try:
-            self.request_receiver.do_recv()
-        except OSError as err:
-            if err.errno == errno.EWOULDBLOCK:
-                return False
-            else:
-                raise
-
-        if self.request_receiver.is_finished():
-            lines, leftover_body = self.request_receiver.split_lines()
-            self.request = ws.http.parser.parse(lines=lines)
-            self.leftover_body = leftover_body
-            return True
-        else:
-            return False
-
-    def build_response(self, can_read, can_write):
-        assert self.state == self.States.building_response
+    def process(self):
         auth_check = self.auth_scheme.check(request=self.request,
                                             address=self.address)
         is_authorized, auth_response = auth_check
@@ -196,74 +261,22 @@ class HTTPExchange:
         else:
             response = ws.http.utils.build_response(405)
 
-        self.response = response
-        if self.response:
-            assert isinstance(self.response, ws.http.structs.HTTPResponse)
-
-            if not self.persist_connection:
-                error_log.debug('Closing connection. (explicitly)')
+        if not self.persist_connection:
+            error_log.debug('Closing connection. (explicitly)')
+            conn = 'close'
+        else:
+            try:
+                conn = str(self.request.headers['Connection'],
+                           encoding='ascii')
+            except (KeyError, UnicodeDecodeError):
+                error_log.debug(
+                    'Getting Connection header from request '
+                    'failed. Closing connection.')
                 conn = 'close'
-            else:
-                try:
-                    conn = str(self.request.headers['Connection'],
-                               encoding='ascii')
-                except (KeyError, UnicodeDecodeError):
-                    error_log.debug('Getting Connection header from request '
-                                    'failed. Closing connection.')
-                    conn = 'close'
-            self.response.headers['Connection'] = conn
-            self.response_sender = ResponseSender(sock=self.sock,
-                                                  response=self.response)
-        else:
-            self.response_sender = None
-        return True
-
-    def respond(self, can_read, can_write):
-        assert self.state == self.States.responding
-
-        if not self.response_sender:
-            return True
-        if not can_write:
-            return False
-
-        assert isinstance(self.response_sender, ResponseSender)
-
-        try:
-            self.response_sender.send_chunk()
-        except OSError as err:
-            if err.errno == errno.EWOULDBLOCK:
-                return False
-            else:
-                raise
-        return self.response_sender.finished
-
-    def handle_error(self, can_read, can_write):
-        assert self.state == self.States.error
-        if exc_handler.can_handle(self.raised_exception):
-            response = exc_handler.handle(self.raised_exception)
-        else:
-            error_log.exception('Could not handle exception. Client will '
-                                'receive a 500 Internal Server Error.')
-            response = ws.http.utils.build_response(500)
-
-        response.headers['Connection'] = 'close'
-
-        try:
-            self.respond(response)
-        except OSError as e:
-            error_log.warning('During cleanup of worker tried to respond to '
-                              'client and close the connection but: '
-                              'caught OSError with ERRNO=%s and MSG=%s',
-                              e.errno, e.strerror)
-
-            if e.errno == errno.ECONNRESET:
-                error_log.warning('Client stopped listening prematurely.'
-                                  ' (no Connection: close header was received)')
-                return suppress
-            else:
-                raise
-
-        return suppress
+        response.headers['Connection'] = conn
+        self.finished = True
+        self.response = response
+        return response
 
     def persisted_connection(self):
         client_persists = self.request and request_is_persistent(self.request)
@@ -273,225 +286,73 @@ class HTTPExchange:
         return client_persists and server_persists
 
 
-class ResponseSender:
-    def __init__(self, sock, response):
+class ResponseReader:
+    def __init__(self, sock):
+        assert isinstance(sock, ws.sockets.Socket)
         self.sock = sock
-        self.response_chunks = response.iter_chunks()
-        self.current_chunk = next(self.response_chunks)
-        self.sent = 0
+        self.response = None
+        self.chunks = None
+        self.current_chunk = None
         self.finished = False
 
-    def send_chunk(self):
-        if self.finished:
-            return
+    def read_from(self, response):
+        assert isinstance(response, ws.http.structs.HTTPResponse)
+        self.response = response
+        self.chunks = self.response_iterator()
 
-        to_send = self.current_chunk[self.sent:]
-        if not to_send:
+    def read(self):
+        assert not self.finished
+
+        if not self.current_chunk:
             try:
-                self.current_chunk = next(self.response_chunks)
+                self.current_chunk = next(self.chunks)
             except StopIteration:
+                self.current_chunk = b''
                 self.finished = True
-                return
-            to_send = self.current_chunk
-            self.sent = 0
-        self.sent += self.sock.send(to_send)
+
+        return self.current_chunk
+
+    def close(self):
+        error_log.critical(
+            'Close() method on Response reader is not implemented.')
+        # TODO
+        return
+
+    def response_iterator(self, chunk_size=4096):
+        assert isinstance(chunk_size, int)
+        http_fields = io.BytesIO()
+        http_fields.write(bytes(self.response.status_line))
+        http_fields.write(b'\r\n')
+        http_fields.write(bytes(self.response.headers))
+        http_fields.write(b'\r\n\r\n')
+
+        http_fields.seek(0)
+        chunk = http_fields.read(chunk_size)
+        while chunk:
+            yield chunk
+            chunk = http_fields.read(chunk_size)
+
+        yield from self.response.body
 
 
-class ConnectionWorkerBlockingDepreciated:
-    """ Receives/parses requests and sends/encodes back responses.
-
-    Instances of this class MUST be used through a context manager to ensure
-    proper clean up of resources.
-
-    """
-
-    def __init__(self, sock, address, *, auth_scheme, static_files,
-                 worker_ctx):
-        assert isinstance(sock, (ws.sockets.Socket, ws.sockets.SSLSocket))
-        assert isinstance(address, collections.Container)
-        assert isinstance(worker_ctx, collections.Mapping)
-
+class ResponseSender:
+    def __init__(self, sock):
+        assert isinstance(sock, ws.sockets.Socket)
         self.sock = sock
-        self.address = address
-        self.auth_scheme = auth_scheme
-        self.static_files = static_files
-        self.exchanges = []
-        self.worker_ctx = worker_ctx
-        self.conn_ctx = {'start': time.time(), 'end': None}
+        self.chunk_to_send = None
+        self.finished = False
+        self.sent = 0
 
-    @property
-    def exchange(self):
-        return self.exchanges[-1] if self.exchanges else None
+    def stream_chunk(self, chunk):
+        assert isinstance(chunk, (bytearray, bytes))
+        self.chunk_to_send = chunk
 
-    def __enter__(self):
-        return self
+    def send_chunk(self):
+        assert not self.finished
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if not exc_val:
-            return False
-
-        if self.exchange['written']:
-            error_log.warning(
-                'An exception occurred after worker had sent bytes over '
-                'the socket(fileno=%s). Client will receive an invalid '
-                'HTTP response.',
-                self.sock.fileno()
-            )
-            return False
-
-        if exc_handler.can_handle(exc_val):
-            response, suppress = exc_handler.handle(exc_val)
-            if not response:
-                # no need to send back a response
-                return suppress
-        else:
-            error_log.exception('Could not handle exception. Client will '
-                                'receive a 500 Internal Server Error.')
-            response, suppress = ws.http.utils.build_response(500), False
-
-        response.headers['Connection'] = 'close'
-
-        try:
-            self.respond(response)
-        except OSError as e:
-            error_log.warning('During cleanup of worker tried to respond to '
-                              'client and close the connection but: '
-                              'caught OSError with ERRNO=%s and MSG=%s',
-                              e.errno, e.strerror)
-
-            if e.errno == errno.ECONNRESET:
-                error_log.warning('Client stopped listening prematurely.'
-                                  ' (no Connection: close header was received)')
-                return suppress
-            else:
-                raise
-
-        return suppress
-
-    def push_exchange(self):
-        self.exchanges.append(dict(
-            request=None,
-            response=None,
-            written=False,
-        ))
-
-    def process_connection(self, quick_reply_with=None):
-        """ Continually serve an http connection.
-
-        :param quick_reply_with: If given will be sent to the client immediately
-        as a response without parsing his request.
-        :return: This method doesn't return until the connection is closed.
-        """
-        if quick_reply_with:
-            assert isinstance(quick_reply_with, ws.http.structs.HTTPResponse)
-
-            self.push_exchange()
-            self.respond(quick_reply_with)
-
-        while True:
-            error_log.debug(
-                'HTTP Connection is open. Pushing new http exchange '
-                'context and parsing request...')
-            self.push_exchange()
-            with record_rusage(self.exchange):
-                request, body_start = ws.http.parser.parse(self.sock)
-                self.exchange['request'] = request
-                self.exchange['body_start'] = body_start
-                response = self.handle_request(request)
-                error_log.debug3('Request handler succeeded.')
-                response = self.respond(response)
-                client_persists = request and request_is_persistent(request)
-                server_persists = response and response_is_persistent(response)
-
-                if not (client_persists and server_persists):
-                    break
-
-    def handle_request(self, request):
-        auth_check = self.auth_scheme.check(request=request,
-                                            address=self.address)
-        is_authorized, auth_response = auth_check
-
-        route = request.request_line.request_target.path
-        method = request.request_line.method
-        error_log.debug3('Incoming request {} {}'.format(method, route))
-
-        if not is_authorized:
-            response = auth_response
-        elif method == 'GET':
-            if ws.serve.is_status_route(route):
-                request_stats = self.worker_ctx['request_stats']
-                response = ws.serve.worker_status(request_stats=request_stats)
-            else:
-                static_response = self.static_files.get_route(route)
-                if static_response.status_line.status_code == 200:
-                    response = static_response
-                elif ws.cgi.can_handle_request(request):
-                    response = ws.cgi.execute_script(
-                        request,
-                        socket=self.sock,
-                        body_start=self.exchange['body_start']
-                    )
-                else:
-                    response = ws.http.utils.build_response(404)
-        elif ws.cgi.can_handle_request(request):
-            response = ws.cgi.execute_script(
-                request,
-                socket=self.sock,
-                body_start=self.exchange['body_start']
-            )
-        else:
-            response = ws.http.utils.build_response(405)
-
-        return response
-
-    def respond(self, response=None, *, closing=False):
-        """
-
-        :param response: Response object to send to client
-        :param closing: Boolean switch whether the http connection should be
-            closed after this response.
-        """
-        assert isinstance(closing, bool)
-
-        self.exchange['response'] = response
-
-        if response:
-            assert isinstance(response, ws.http.structs.HTTPResponse)
-
-            request = self.exchange['request']
-            if closing:
-                error_log.debug('Closing connection. (explicitly)')
-                conn = 'close'
-            elif request:
-                try:
-                    conn = str(request.headers['Connection'], encoding='ascii')
-                except (KeyError, UnicodeDecodeError):
-                    error_log.debug('Getting Connection header from request '
-                                    'failed. Closing connection.')
-                    conn = 'close'
-            else:
-                error_log.debug('No request parsed. Closing connection.')
-                conn = 'close'
-            response.headers['Connection'] = conn
-            self.exchange['written'] = True
-            for chunk in response.iter_chunks():
-                self.sock.sendall(chunk)
-
-        return response
-
-    def status_codes(self):
-        return tuple(e['response'].status_line.status_code
-                     for e in self.exchanges if e['response'])
-
-    def generate_stats(self):
-        for exchange in self.exchanges:
-            stats = {}
-            keys = frozenset(['request_time', 'ru_stime', 'ru_utime',
-                              'ru_maxrss'])
-            for k, v in exchange.items():
-                if k in keys:
-                    stats[k] = v
-            yield stats
+        self.sent += self.sock.send(self.chunk_to_send)
+        self.chunk_to_send = self.chunk_to_send[self.sent:]
+        self.finished = bool(self.chunk_to_send)
 
 
 @contextlib.contextmanager
