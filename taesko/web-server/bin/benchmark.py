@@ -136,7 +136,7 @@ def parse_default(text, value):
                    name=text, value=value, value_suffix='')
 
 
-def parse_ab_out(out, type_=ABOutTypes.default):
+def parse_ab_out(out):
     field_regex = re.compile(r'\s*(.+?)\s*:\s*(.*)\s*')
 
     result = []
