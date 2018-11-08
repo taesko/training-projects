@@ -26,33 +26,49 @@ class ConnectionWorker:
                  worker_stats, persist_connection):
         self.sock = sock
         self.address = address
-        self.finished = False
         self.persist_connection = persist_connection
         self.auth_scheme = auth_scheme
         self.static_files = static_files
         self.worker_stats = worker_stats
         self.exchange = None
+        self.exchanges = []
         self.push_exchange()
 
+    @property
+    def finished(self):
+        if self.exchange.state == HTTPExchange.States.finished:
+            if self.persist_connection and self.exchange.persisted_connection():
+                return False
+            else:
+                return True
+
+    def status_codes(self):
+        codes = []
+
+        error_log.debug3('HTTPExchanges are %s', self.exchanges)
+        for exchange in self.exchanges:
+            code = exchange.response_reader.response.status_line.status_code
+            codes.append(code)
+
+        return codes
+
     def push_exchange(self):
+        error_log.info('Pushing new HTTPExchange.')
         self.exchange = HTTPExchange(
             sock=self.sock, address=self.address, auth_scheme=self.auth_scheme,
             static_files=self.static_files, worker_stats=self.worker_stats,
             persist_connection=self.persist_connection
         )
+        self.exchanges.append(self.exchange)
 
-    def work(self, readable_fds, writable_fds, failed_fds):
+    def process(self, readable_fds, writable_fds, failed_fds):
+        assert not self.finished
         if self.exchange.state == HTTPExchange.States.finished:
-            if self.persist_connection and self.exchange.persisted_connection():
-                self.push_exchange()
-            else:
-                self.finished = True
-                return
-        else:
-            assert isinstance(self.exchange, HTTPExchange)
-            self.exchange.process(readable_fds=readable_fds,
-                                  writable_fds=writable_fds,
-                                  failed_fds=failed_fds)
+            self.push_exchange()
+        assert isinstance(self.exchange, HTTPExchange)
+        self.exchange.process(readable_fds=readable_fds,
+                              writable_fds=writable_fds,
+                              failed_fds=failed_fds)
 
 
 class HTTPExchange:
@@ -72,9 +88,9 @@ class HTTPExchange:
         self.address = address
         self.required_fds = [self.sock]
         self.persist_connection = persist_connection
-        self.state = self.States.parsing
+        self.state = self.States.parsing_request
         self.state_machine = {
-            self.States.parsing: self.parse_request,
+            self.States.parsing_request: self.parse_request,
             self.States.handling_request: self.handle_request,
             self.States.reading_response: self.read_response,
             self.States.sending_response: self.send_response,
@@ -82,7 +98,6 @@ class HTTPExchange:
             self.States.broken: self.handle_broken
         }
         self.error = None
-        self.request_profile = ws.profile.Timer()
         self.request_receiver = ws.http.parser.RequestReceiver(sock=sock)
         self.request_handler = RequestHandler(
             sock=sock, address=address, persist_connection=persist_connection,
@@ -95,45 +110,39 @@ class HTTPExchange:
     def process(self, readable_fds, writable_fds, failed_fds):
         assert self.state != self.States.finished
 
-        while self.state != self.States.finished:
-            method = self.state_machine[self.state]
-            # noinspection PyBroadException
-            try:
-                if self.sock.fileno() in failed_fds:
-                    msg = 'Client through socket {} dropped the TCP connection.'
-                    raise BrokenSocketException(msg=msg.format(self.sock),
-                                                code='BROKEN_CLIENT_SOCKET')
+        # noinspection PyBroadException
+        try:
+            if self.sock.fileno() in failed_fds:
+                msg = 'Client through socket {} dropped the TCP connection.'
+                raise BrokenSocketException(msg=msg.format(self.sock),
+                                            code='BROKEN_CLIENT_SOCKET')
 
-                with self.request_profile.time(self.state.value):
-                    next_state = method(readable_fds=readable_fds,
-                                        writable_fds=writable_fds,
-                                        failed_fds=failed_fds)
-            except StateWouldBlockException as err:
-                error_log.debug3("State %s can't complete due to blocking IO. "
-                                 "Error=%s", err)
-                break
-            except (SignalReceivedException, KeyboardInterrupt):
-                # TODO this drops the client connection without a response.
-                # is this okay ?
-                raise
-            except BaseException as exc_val:
-                if self.state in (self.request_receiver, self.request_handler):
-                    error_log.exception('Unhandled exception while handling '
-                                        'request. HTTPExchange state is %s. '
-                                        'Sending a 500 to client.',
-                                        self.state)
-                    response = ws.http.utils.build_response(500)
-                    self.response_reader.read_from(response)
-                    self.state = self.States.reading_response
-                else:
-                    error_log.exception("HTTP exchange through socket %s "
-                                        "entered a broken state.",
-                                        self.sock)
-                    self.state = self.States.broken
-                    # TODO this might not be ok
-                    self.error = exc_val
+            while self.state != self.States.finished:
+                error_log.debug('Executing transition of state %s.',
+                                self.state.value)
+                method = self.state_machine[self.state]
+                self.state = method(readable_fds=readable_fds,
+                                    writable_fds=writable_fds,
+                                    failed_fds=failed_fds)
+                error_log.debug('New state is %s', self.state)
+        except StateWouldBlockException as err:
+            error_log.debug2("State %s can't complete due to blocking IO. "
+                             "CODE=%s MSG=%s",
+                             self.state.value, err.code, err.msg)
+        except (SignalReceivedException, KeyboardInterrupt):
+            # TODO this drops the client connection without a response.
+            # is this okay ?
+            raise
+        except BaseException as exc_val:
+            error_log.exception('Exception occurred while transitioning state.')
+            if self.state in (self.request_receiver, self.request_handler):
+                response = ws.http.utils.build_response(500)
+                self.response_reader.read_from(response)
+                self.state = self.States.reading_response
             else:
-                self.state = next_state
+                self.state = self.States.broken
+                # TODO this might not be ok
+                self.error = exc_val
 
     def parse_request(self, readable_fds, writable_fds, failed_fds):
         assert self.state == self.States.parsing_request
@@ -142,7 +151,7 @@ class HTTPExchange:
         if self.sock.fileno() not in readable_fds:
             raise StateWouldBlockException(msg='Cannot read from socket {}.'
                                            .format(self.sock),
-                                           code='PARSE_REQ_SOCK_NOT_READABLE')
+                                           code='PARSE_REQ_SOCK_BLOCKS')
         try:
             while not self.request_receiver.is_finished():
                 self.request_receiver.do_recv()
@@ -155,10 +164,17 @@ class HTTPExchange:
             raise StateWouldBlockException(msg=msg.format(self.sock),
                                            code='PARSE_REQ_SOCK_READ_EXH') from err
 
+        error_log.debug3('Received request chunks %s',
+                         self.request_receiver.chunks)
         lines, leftover_body = self.request_receiver.split_lines()
+        error_log.debug3('Received lines %s with leftover body: %s',
+                         lines,
+                         leftover_body)
         try:
             request = ws.http.parser.parse(lines=lines)
-        except ws.http.parser.ParserException:
+        except ws.http.parser.ParserException as err:
+            error_log.warning('Parsing error occurred with CODE=%s and MSG=%s',
+                              err.code, err.msg)
             self.response_reader.read_from(ws.http.utils.build_response(400))
             return self.States.reading_response
         else:
@@ -177,9 +193,11 @@ class HTTPExchange:
         assert self.state == self.States.reading_response
         # TODO check if fds of response are ready
         if self.response_reader.finished:
-            return self.States.finalizing
+            return self.States.cleaning
         else:
             chunk = self.response_reader.read()
+            if not chunk:
+                return self.States.cleaning
             self.response_sender.stream_chunk(chunk)
             return self.States.sending_response
 
@@ -291,25 +309,27 @@ class ResponseReader:
         assert isinstance(sock, ws.sockets.Socket)
         self.sock = sock
         self.response = None
-        self.chunks = None
+        self.chunks_iter = None
         self.current_chunk = None
         self.finished = False
 
     def read_from(self, response):
         assert isinstance(response, ws.http.structs.HTTPResponse)
+        error_log.debug3('Reading chunks of response from %s', response)
         self.response = response
-        self.chunks = self.response_iterator()
+        self.chunks_iter = self.response_iterator()
 
     def read(self):
         assert not self.finished
 
-        if not self.current_chunk:
-            try:
-                self.current_chunk = next(self.chunks)
-            except StopIteration:
-                self.current_chunk = b''
-                self.finished = True
+        try:
+            self.current_chunk = next(self.chunks_iter)
+        except StopIteration:
+            self.current_chunk = b''
+            self.finished = True
 
+        error_log.debug3('Read response chunk of size %s bytes. Chunk=%s',
+                         len(self.current_chunk), self.current_chunk)
         return self.current_chunk
 
     def close(self):
@@ -328,9 +348,11 @@ class ResponseReader:
 
         http_fields.seek(0)
         chunk = http_fields.read(chunk_size)
+        error_log.debug3('http_fields.read() = %s', chunk)
         while chunk:
             yield chunk
             chunk = http_fields.read(chunk_size)
+            error_log.debug3('http_fields.read() = %s', chunk)
 
         yield from self.response.body
 
@@ -346,13 +368,19 @@ class ResponseSender:
     def stream_chunk(self, chunk):
         assert isinstance(chunk, (bytearray, bytes))
         self.chunk_to_send = chunk
+        self.finished = False
+        self.sent = 0
+        error_log.debug3('Streaming new chunk through ResponseSender.')
 
     def send_chunk(self):
         assert not self.finished
 
-        self.sent += self.sock.send(self.chunk_to_send)
-        self.chunk_to_send = self.chunk_to_send[self.sent:]
-        self.finished = bool(self.chunk_to_send)
+        leftover = self.chunk_to_send[self.sent:]
+        self.sent += self.sock.send(leftover)
+        error_log.debug3('Sent %s/%s bytes of response chunk. Bytes are %s',
+                         self.sent, len(self.chunk_to_send),
+                         leftover)
+        self.finished = self.sent == len(self.chunk_to_send)
 
 
 @contextlib.contextmanager

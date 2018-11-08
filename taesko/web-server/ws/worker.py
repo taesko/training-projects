@@ -10,7 +10,7 @@ import ws.signals
 import ws.serve
 from ws.err import *
 from ws.config import config
-from ws.logs import error_log, access_log
+from ws.logs import error_log
 
 
 class Worker:
@@ -88,43 +88,59 @@ class Worker:
 
         while True:
             # TODO connection_workers is a horrible name
-            connected_sockets = tuple(self.connection_workers.keys())
-            rlist = connected_sockets + (self.fd_transport,)
+            connected_sockets = tuple(conn[0].fileno() for conn in
+                                      self.connection_workers.keys())
+            rlist = connected_sockets + (self.fd_transport.fileno(),)
             wlist = connected_sockets
             xlist = []  # TODO wat ?
+            error_log.debug3('select() on descriptors %s, %s, %s',
+                             rlist, wlist, xlist)
             try:
                 # have select block indefinitely because our only purpose is to
                 # work... forever...
-                rlist, wlist, xlist = select.select(
-                    rlist=rlist, wlist=wlist, xlist=xlist, timeout=None
-                )
+                rlist, wlist, xlist = select.select(rlist, wlist, xlist, None)
             except OSError as err:
                 error_log.warning('select() failed with ERRNO=%s and MSG=%s',
                                   err.errno, err.strerror)
                 continue
 
-            rset, wset = frozenset(rlist), frozenset(wlist)
-            if self.fd_transport in rset:
+            rset = frozenset(rlist)
+            wset = frozenset(wlist)
+            xset = frozenset(xlist)
+
+            leftover_conn_workers = {}
+            for conn, conn_worker in self.connection_workers.items():
+                error_log.debug3('Processing connection %s', conn)
+                sock, address = conn
+                try:
+                    conn_worker.process(readable_fds=rset,
+                                        writable_fds=wset,
+                                        failed_fds=xset)
+                except (SignalReceivedException, KeyboardInterrupt):
+                    raise
+                except (ServerException, AssertionError):
+                    error_log.exception('Unhandled exception in work() method. '
+                                        'Socket=%s', sock)
+                else:
+                    if conn_worker.finished:
+                        self.rate_controller.record_handled_connection(
+                            ip_address=address[0],
+                            status_codes=conn_worker.status_codes()
+                        )
+                        sock.close(pass_silently=True)
+                    else:
+                        leftover_conn_workers[conn] = conn_worker
+            self.connection_workers = leftover_conn_workers
+            error_log.debug2('Connections that still require processing are %s',
+                             self.connection_workers.keys())
+
+            if self.fd_transport.fileno() in rset:
                 new_connections = self.recv_new_sockets()
                 for sock, address in new_connections:
                     conn = (sock, address)
                     conn_worker = self.handle_connection(socket=sock,
                                                          address=address)
                     self.connection_workers[conn] = conn_worker
-
-            leftover_conn_workers = {}
-            for conn, conn_worker in self.connection_workers.items():
-                sock, address = conn
-                conn_worker.process(can_read=sock in rset, can_write=sock in wset)
-                if conn_worker.state == conn_worker.States.finished:
-                    self.rate_controller.record_handled_connection(
-                        ip_address=address[0],
-                        status_codes=conn_worker.status_codes()
-                    )
-                    sock.close(pass_silently=True)
-                else:
-                    leftover_conn_workers[conn] = conn_worker
-            self.connection_workers = leftover_conn_workers
 
     def cleanup(self):
         error_log.info('Cleaning up... %s total leftover connections.',
@@ -173,4 +189,5 @@ class Worker:
         return ws.cworker.ConnectionWorker(sock=wrapped_sock, address=address,
                                            auth_scheme=self.auth_scheme,
                                            static_files=self.static_files,
-                                           worker_ctx={})
+                                           worker_stats={},
+                                           persist_connection=True)

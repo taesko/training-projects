@@ -77,10 +77,12 @@ class RequestReceiver:
             raise ParserException(code='CS_PEER_SEND_IS_TOO_SLOW')
         if not chunk:
             raise ParserException(code='CS_PEER_NOT_SENDING')
+        self.chunks.append(chunk)
         self.total_length += len(chunk)
         self.body_offset = chunk.find(b'\r\n\r\n')
         if self.body_offset != -1:
             self.body_offset += 4
+            error_log.debug('Body starts at offset %s', self.body_offset)
 
     def split_lines(self):
         assert self.is_finished()
@@ -88,11 +90,11 @@ class RequestReceiver:
         leftover_body = b''
         for i, chunk in enumerate(self.chunks):
             if i == len(self.chunks) - 1:
-                line_chunk = chunk[:self.body_offset]
+                line_chunk = chunk[:self.body_offset - 4]
                 leftover_body = chunk[self.body_offset:]
             else:
                 line_chunk = chunk
-            lines.extend(line_chunk.split('\r\n'))
+            lines.extend(line_chunk.split(b'\r\n'))
         return lines, leftover_body
 
 
