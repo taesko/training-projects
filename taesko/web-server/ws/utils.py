@@ -5,6 +5,85 @@ import collections
 import ws.logs
 
 
+class StateWouldBlockException(Exception):
+    pass
+
+
+class StateMachineBroke(Exception):
+    pass
+
+
+class StateMachine:
+    def __init__(self, machine_table, initial_transition):
+        assert isinstance(machine_table, collections.Sequence)
+        assert isinstance(initial_transition, str)
+
+        self.states = copy.deepcopy(machine_table)
+        self.transitions = {}
+        self.broken = False
+
+        for state in machine_table:
+            for trans in state.transitions:
+                assert trans.name not in self.transitions
+                self.transitions[trans.name] = trans
+
+        self.transition = self.transitions[initial_transition]
+        assert self.verify()
+
+    def verify(self):
+        for name, state in self.states.items():
+            assert name == state.name
+            assert isinstance(state, State)
+            assert isinstance(state.name, str)
+            assert isinstance(state.final, bool)
+            assert not state.final and state.transitions
+            for trans in state.transitions:
+                assert isinstance(trans.next, str)
+                assert trans.next in self.states
+                assert isinstance(trans.callback, collections.Callable)
+        assert isinstance(self.transition, Transition)
+
+    def current_state(self):
+        for state in self.states.values():
+            if self.transition.name in state.transitions:
+                return state
+        assert False
+
+
+    def finished(self):
+        return self.current_state().final
+
+    def run(self, *args, **kwargs):
+        if self.broken:
+            raise StateMachineBroke(msg='Prior call to run() failed with an '
+                                        'unhandled exception. Cannot continue '
+                                        'operation.')
+        while not self.finished():
+            ws.logs.error_log.debug('Executing transition %s to %s.',
+                                    self.transition.name,
+                                    self.transition.next)
+            try:
+                new_trans_name = self.transition.callback(*args, **kwargs)
+            except StateWouldBlockException:
+                ws.logs.error_log.debug('Transition %s to %s would '
+                                        'have blocked. Returning from run() '
+                                        'without advancing state.',
+                                        self.transition.name,
+                                        self.transition.next)
+                break
+            except:
+                self.broken = True
+                raise
+            assert new_trans_name in self.current_state().transitions
+            self.transition = self.transitions[new_trans_name]
+        ws.logs.error_log.debug('State %s is final. Returning from run() '
+                                'method..', self.transition.current)
+
+
+State = collections.namedtuple('State', ['name', 'final', 'callback',
+                                         'transitions'])
+Transition = collections.namedtuple('Transition', ['name', 'callback', 'next'])
+
 def depreciated(log=ws.logs.error_log):
     assert isinstance(log, logging.Logger)
 
@@ -18,57 +97,3 @@ def depreciated(log=ws.logs.error_log):
     return decorator
 
 
-class StateMachine:
-    State = collections.namedtuple('State', ['name', 'transitions', 'final'])
-    Transition = collections.namedtuple('Transition', ['name',
-                                                       'current_state',
-                                                       'callback',
-                                                       'next_state'])
-
-    def __init__(self, machine_table, initial, initial_transition):
-        assert isinstance(machine_table, collections.Mapping)
-        assert isinstance(initial, str)
-        assert initial in machine_table
-
-        self.states = copy.deepcopy(machine_table)
-        self.transitions = {}
-
-        for state in machine_table:
-            for trans in state.transitions:
-                self.transitions[trans.name] = trans
-
-        self.machine_table = machine_table
-        self.state = self.machine_table[initial]
-        self.transition = initial_transition
-        assert self.verify()
-
-    def verify(self):
-        for name, state in self.machine_table.items():
-            assert name == state.name
-            assert isinstance(state, self.State)
-            assert isinstance(state.name, str)
-            assert not state.final and state.transitions
-            for trans in state.transitions:
-                assert isinstance(trans.current_state, str)
-                assert isinstance(trans.next_state, str)
-                assert trans.current_state in self.machine_table
-                assert trans.next_state in self.machine_table
-                assert isinstance(trans.callback, collections.Callable)
-                assert trans.current_state == state.name
-        assert isinstance(self.transition, self.Transition)
-        assert self.transition in self.states[self.transition.current_state]
-
-    def run(self, *args, **kwargs):
-        assert self.transition.current_state == self.state
-        while not self.state.final:
-            new_trans = self.transition.callback(*args, **kwargs)
-            new_state = self.machine_table[new_trans.current_state.name]
-            assert isinstance(new_trans, self.Transition)
-            assert self.transition.next_state == new_trans.current_state
-            assert new_trans in self.machine_table[new_trans.current_state]
-            self.state = self.transition.next_state
-            self.transition = new_trans
-
-
-class StateWouldBlockException(Exception):
-    pass

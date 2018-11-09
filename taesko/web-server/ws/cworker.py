@@ -17,6 +17,7 @@ from ws.config import config
 from ws.err import *
 from ws.http.utils import request_is_persistent, response_is_persistent
 from ws.logs import error_log, access_log
+from ws.utils import StateMachine, State, Transition, StateWouldBlockException
 
 CLIENT_ERRORS_THRESHOLD = config.getint('http', 'client_errors_threshold')
 
@@ -84,18 +85,51 @@ class HTTPExchange:
 
     def __init__(self, sock, address, *, auth_scheme, static_files,
                  worker_stats, persist_connection):
+        self.state_machine = StateMachine(
+            machine_table=[
+                State(name='parsing_request',
+                      final=False,
+                      callback=self.read_response,
+                      transitions={
+                          'parse_ok'    : 'handling_request',
+                          'parse_failed': 'reading_response'
+                      }),
+                State(name='handling_request',
+                      final=False,
+                      callback=self.handle_request,
+                      transitions={ 'built_response': 'reading_response' })
+                State(name='reading_response',
+                      final=False,
+                      callback=self.read_response,
+                      transitions={
+                          'already_done': 'cleaning_up',
+                          'read_chunk': 'sending_response'
+                      }),
+                State(name='cleaning_up',
+                      final=False,
+                      callback=self.cleanup,
+                      transitions={
+                          'done': 'finished'
+                      }),
+                State(name='finished',
+                      final=True,
+                      callback=None,
+                      transitions=None)
+            ],
+            initial_state='parsing_request'
+        )
         self.sock = sock
         self.address = address
         self.required_fds = [self.sock]
         self.persist_connection = persist_connection
         self.state = self.States.parsing_request
         self.state_machine = {
-            self.States.parsing_request: self.parse_request,
+            self.States.parsing_request : self.parse_request,
             self.States.handling_request: self.handle_request,
             self.States.reading_response: self.read_response,
             self.States.sending_response: self.send_response,
-            self.States.cleaning: self.cleanup,
-            self.States.broken: self.handle_broken
+            self.States.cleaning        : self.cleanup,
+            self.States.broken          : self.handle_broken
         }
         self.error = None
         self.request_receiver = ws.http.parser.RequestReceiver(sock=sock)
