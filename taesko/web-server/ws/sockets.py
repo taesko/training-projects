@@ -1,10 +1,11 @@
 import array
 import socket
 import ssl
-from ssl import Purpose
 # noinspection PyUnresolvedReferences
 from socket import (SHUT_WR, SHUT_RD, SHUT_RDWR, AF_INET, SOCK_STREAM,
                     SOL_SOCKET, SO_REUSEADDR)
+from ssl import Purpose
+
 from ws.logs import error_log
 
 SHUTDOWN_MSGS = {

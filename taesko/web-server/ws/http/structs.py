@@ -1,6 +1,4 @@
 import collections
-import io
-
 
 HTTPRequest = collections.namedtuple('HTTPRequest', ['request_line',
                                                      'headers'])
@@ -54,10 +52,9 @@ class URI(collections.namedtuple('URI', ['protocol', 'host', 'port',
         return str(self).encode('ascii')
 
 
-class HTTPResponse(collections.namedtuple('HTTPResponse', ['status_line',
-                                                           'headers',
-                                                           'body'])):
-    pass
+HTTPResponse = collections.namedtuple('HTTPResponse', ['status_line',
+                                                       'headers',
+                                                       'body'])
 
 
 class HTTPStatusLine(
