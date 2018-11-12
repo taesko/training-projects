@@ -96,57 +96,26 @@ class HTTPExchange:
     def __init__(self, sock, address, *, auth_scheme, static_files,
                  worker_stats, persist_connection):
         self.state_machine = StateMachine(
-            # TODO turn into data.
-            machine_table=[
-                State(name='parsing_request',
-                      final=False,
-                      callback=self.parse_request,
-                      transitions={
-                          'parse_ok': 'handling_request',
-                          'parse_failed': 'reading_response'
-                      }),
-                State(name='handling_request',
-                      final=False,
-                      callback=self.handle_request,
-                      transitions={'built_response': 'reading_response'}),
-                State(name='reading_response',
-                      final=False,
-                      callback=self.read_response,
-                      transitions={
-                          'done_reading': 'cleaning_up',
-                          'read_chunk': 'sending_response'
-                      }),
-                State(name='sending_response',
-                      final=False,
-                      callback=self.send_response,
-                      transitions={
-                          'sent_all': 'reading_response',
-                          'sent_partial': 'sending_response'
-                      }),
-                State(name='cleaning_up',
-                      final=False,
-                      callback=self.cleanup,
-                      transitions={
-                          'done_cleaning': 'done'
-                      }),
-                State(name='done',
-                      final=True,
-                      callback=None,
-                      transitions=None),
-                State(name='handling_exception',
-                      final=False,
-                      callback=self.built_error_response,
-                      transitions={
-                          'handled_exception': 'reading_response'
-                      }),
-                State(name='failing',
-                      final=False,
-                      callback=self.fail,
-                      transitions={
-                          'failed': 'cleaning_up'
-                      })
-            ],
+            states={
+                'parsing_request': ('handling_request', 'reading_response'),
+                'handling_request': ('reading_response', ),
+                'reading_response': ('sending_response', 'cleaning_up'),
+                'sending_response': ('sending_response', 'reading_response'),
+                'cleaning_up': ('done', ),
+                'done': (),
+                'failed': ('sending_response', 'cleaning_up')
+            },
+            callbacks = {
+                'parsing_request': self.parse_request,
+                'handling_request': self.handle_request,
+                'reading_response': self.read_response,
+                'sending_response': self.send_response,
+                'cleaning_up': self.cleanup,
+                'done': None,
+                'failed': self.built_error_response,
+            },
             initial_state='parsing_request',
+            state_on_exc='failed',
         )
         self.sock = sock
         self.address = address

@@ -12,28 +12,77 @@ class StateWouldBlockException(Exception):
 
 
 class StateMachine:
-    """ State machine pattern that supports transition to multiple states.
+    """ State machine pattern that supports multiple transitions and error handling.
 
+    User's can transition to multiple possible states by calling the
+    self.transition_to() method from inside a state callback.
+    If an exception is raised from a callback the machine can transition to
+    a default error state.
+    See help of __init__ for parameter description and setup.
     """
 
-    def __init__(self, machine_table, initial_state):
-        assert isinstance(machine_table, collections.Sequence)
+
+    def __init__(self, states, callbacks, initial_state, state_on_exc):
+        """ Setup the state machine - run() needs to be explicitly called.
+
+        :param states: A mapping of one state to a sequence of states it can
+            transition to. If a state is final the sequence must be empty.
+            The first state in the sequence is assumed to be the default
+            state to transition to when self.transition_to() is not explicitly
+            called.
+        :param callbacks: A mapping between a state and it's callback.
+            States that are not final should not be in here.
+        :param initial_state: Name of the first state.
+        :param state_on_exc: A mapping to configure exception handling states.
+            It MUST contain a SINGLE key which is the name of the error state.
+            The value must be a dict with two keys who's values are sequences:
+                from: states from which the machine will transition to an error
+                    if an exception is raised.
+                to: states to which the machine can transition after error
+                    handling.
+        """
+        assert isinstance(states, collections.Mapping)
+        assert isinstance(callbacks, collections.Mapping)
         assert isinstance(initial_state, str)
+        assert isinstance(state_on_exc, str)
+        assert initial_state in states
+        assert state_on_exc in states
 
-        self.states = {}
+        for state, allowed_transitions in states.items():
+            assert isinstance(state, str)
+            for s in allowed_transitions:
+                assert s in states
 
-        for state in machine_table:
-            self.states[state.name] = state
-            assert isinstance(state, State)
-            if state.on_exception:
-                assert state.on_exception in [state.name
-                                              for state in machine_table]
+            if not states[state]:
+                assert state not in callbacks
+            if state == initial_state:
+                assert state not in callbacks
+            assert state in callbacks
 
+            if state not in (initial_state, state_on_exc):
+                for other_state, other_allowed in states.items():
+                    if other_state != state and other_state in other_allowed:
+                        break
+                else:
+                    assert False, 'No transition to {}'.format(state)
+        for state, cb in callbacks.items():
+            assert state in states
+            assert isinstance(cb, collections.Callable)
+
+        self.states = states
+        self.callbacks = callbacks
+        self.state_on_exc = state_on_exc
+        # below fields need to be reset on every transition.
         self.state = self.states[initial_state]
+        self.explicit_transition = None
         self.exception = None
 
     def finished(self):
-        return self.state.final
+        return bool(self.states[self.state])
+
+    def transition_to(self, state):
+        assert state in self.states
+        self.explicit_transition = state
 
     def run(self, *args, **kwargs):
         while not self.finished():
@@ -41,36 +90,39 @@ class StateMachine:
             ws.logs.error_log.debug3('StateMachine: Running %s',
                                      self.state)
             try:
-                new_trans_name = self.state.callback(*args, **kwargs)
+                self.callbacks[self.state](*args, **kwargs)
             except StateWouldBlockException as err:
                 ws.logs.error_log.debug3('StateMachine: %s would block. '
                                          'CODE=%s MSG=%s',
                                          self.state, err.code, err.msg)
                 break
             except BaseException as err:
+                if self.state == self.state_on_exc:
+                    raise
                 # It's possible to enter an infinite loop here because
                 # a state after error throws an error again.
                 # TODO guarantee this doesn't happen without reducing
                 # flexibility
-                if self.state.on_exception:
-                    next_state = self.states[self.state.on_exception]
-                    ws.logs.error_log.debug('StateMachine: %s > EXCEPTION > %s',
-                                            self.state,
-                                            next_state)
-                    self.state = next_state
-                    self.exception = err
-                else:
-                    raise
+                next_state = self.state_on_exc
+                ws.logs.error_log.debug('StateMachine: %s > EXCEPTION > %s',
+                                        self.state,
+                                        next_state)
+                self.state = next_state
+                self.explicit_transition = None
+                self.exception = err
             else:
-                self.exception = None
-                transition = next(t for t in self.state.transitions
-                                  if t.name == new_trans_name)
+                if self.explicit_transition:
+                    transition = self.explicit_transition
+                else:
+                    transition = next(self.states[self.state])
                 next_state = self.states[transition.next]
                 ws.logs.error_log.debug2('StateMachine: %s ~ %s > %s',
                                          self.state,
                                          transition,
                                          next_state)
                 self.state = next_state
+                self.explicit_transition = None
+                self.exception = None
         else:
             ws.logs.error_log.debug('StateMachine: %s is FINAL.', self.state)
 
