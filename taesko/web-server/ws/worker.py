@@ -121,6 +121,7 @@ class Worker:
                 except (ServerException, AssertionError):
                     error_log.exception('Unhandled exception in work() method. '
                                         'Socket=%s', sock)
+                    sock.close(pass_silently=True)
                 else:
                     if conn_worker.finished:
                         self.rate_controller.record_handled_connection(
@@ -130,6 +131,7 @@ class Worker:
                         sock.close(pass_silently=True)
                     else:
                         leftover_conn_workers[conn] = conn_worker
+
             self.connection_workers = leftover_conn_workers
             error_log.debug2('Connections that still require processing are %s',
                              self.connection_workers.keys())

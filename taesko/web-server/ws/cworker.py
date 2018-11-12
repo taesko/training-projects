@@ -16,7 +16,8 @@ import ws.sockets
 from ws.config import config
 from ws.http.utils import request_is_persistent, response_is_persistent
 from ws.logs import error_log, access_log
-from ws.utils import StateMachine, State, StateWouldBlockException
+from ws.utils import StateMachine, StateWouldBlockException
+from ws.err import BrokenSocketException
 
 CLIENT_ERRORS_THRESHOLD = config.getint('http', 'client_errors_threshold')
 
@@ -36,14 +37,9 @@ class ConnectionWorker:
     def finished(self):
         if not self.exchanges:
             return False
-        elif self.exchanges[-1].state_machine.finished():
-            exchange = self.exchanges[-1]
-            if self.persist_connection and exchange.persisted_connection():
-                return False
-            else:
-                return True
         else:
-            return False
+            e = self.exchanges[-1]
+            return e.state_machine.finished() and not e.persisted_connection()
 
     def status_codes(self):
         codes = []
@@ -97,25 +93,26 @@ class HTTPExchange:
                  worker_stats, persist_connection):
         self.state_machine = StateMachine(
             states={
-                'parsing_request': ('handling_request', 'reading_response'),
-                'handling_request': ('reading_response', ),
+                'parsing_request': ('handling_request', 'reading_response',
+                                    'parsing_request'),
+                'handling_request': ('reading_response',),
                 'reading_response': ('sending_response', 'cleaning_up'),
                 'sending_response': ('sending_response', 'reading_response'),
-                'cleaning_up': ('done', ),
+                'cleaning_up': ('done',),
                 'done': (),
-                'failed': ('sending_response', 'cleaning_up')
+                'failed': ('sending_response', )
             },
-            callbacks = {
+            callbacks={
                 'parsing_request': self.parse_request,
                 'handling_request': self.handle_request,
                 'reading_response': self.read_response,
                 'sending_response': self.send_response,
                 'cleaning_up': self.cleanup,
-                'done': None,
-                'failed': self.built_error_response,
+                'failed': self.build_error_response,
             },
             initial_state='parsing_request',
             state_on_exc='failed',
+            allowed_exc_handling={'parsing_request', 'handling_request'}
         )
         self.sock = sock
         self.address = address
@@ -134,41 +131,40 @@ class HTTPExchange:
         self.static_files = static_files
         self.worker_stats = worker_stats
 
-        # TODO error handling of states
-        # error_log.exception('Exception occurred while transitioning state.')
-        # if self.state in (self.request_receiver, self.request_handler):
-        #     response = ws.http.utils.build_response(500)
-        #     self.response_reader.read_from(response)
-        #     self.state = self.States.reading_response
-        # else:
-        #     self.state = self.States.broken
-        #     # TODO this might not be ok
-        #     self.error = exc_val
-        # if self.sock.fileno() in failed_fds:
-        #     msg = 'Client through socket {} dropped the TCP connection.'
-        #     raise BrokenSocketException(msg=msg.format(self.sock),
-        #                                 code='BROKEN_CLIENT_SOCKET')
+        self.read_fds = []
+        self.write_fds = []
 
-    # noinspection PyUnusedLocal
-    def built_error_response(self, readable_fds, writable_fds, failed_fds):
-        """ State method for possible recovery from exceptions."""
-        error_log.exception('Exception occurred during processing of request '
-                            'on connection %s / %s. Sending a 500 to client.',
-                            self.sock, self.address,
-                            exc_info=self.state_machine.exception)
+    def run(self, readable_fds, writable_fds, failed_fds):
+        if self.sock.fileno() in failed_fds:
+            exc = BrokenSocketException(msg='Connection %s / %s broke.'
+                                        .format(self.sock, self.address),
+                                        code='EXCHANGE_SOCKET_FD_FAILED')
+            self.state_machine.throw(exc)
+            self.state_machine.run()
+        all_fds = (*self.read_fds, *self.write_fds)
+        failed = any(fd in failed_fds for fd in all_fds)
+        can_read = all(fd in readable_fds for fd in self.read_fds)
+        can_write = all(fd in writable_fds for fd in self.write_fds)
+        elif self.can_do_io(readable_fds, writable_fds, failed_fds):
+            self.state_machine.run()
+
+    def fail_on_dropped_socket(self, method):
+        def wrapped(*args, **kwargs):
+            if
+    def persisted_connection(self):
+        client_persists = self.request and request_is_persistent(self.request)
+        server_persists = (self.response and
+                           response_is_persistent(self.response))
+
+        return client_persists and server_persists
+
+    def build_error_response(self):
+        error_log.error('Exception occurred during processing of request '
+                        'on connection %s / %s. Sending a 500 to client.',
+                        self.sock, self.address,
+                        exc_info=self.state_machine.exception)
         self.response = ws.http.utils.build_response(500)
-        return 'handled_exception'
 
-    # noinspection PyUnusedLocal
-    def fail(self, readable_fds, writable_fds, failed_fds):
-        """ State method for impossible recovery from exceptions."""
-        error_log.exception('Processing of request on connection %s / %s '
-                            'failed. Client will not receive a response.',
-                            self.sock, self.address,
-                            exc_info=self.state_machine.exception)
-        return 'failing'
-
-    # noinspection PyUnusedLocal
     def parse_request(self, readable_fds, writable_fds, failed_fds):
         if self.sock.fileno() not in readable_fds:
             raise StateWouldBlockException(msg='Cannot read from socket {}.'
@@ -180,32 +176,31 @@ class HTTPExchange:
         except ws.http.parser.ParserException:
             error_log.exception('Socket %s failed.')
             self.response = ws.http.utils.build_response(400)
-            return 'parse_failed'
+            self.state_machine.transition_to('reading_response')
+            return
         except BlockingIOError as err:
             msg = 'No more data in read buffer of socket {}.'
             exc = StateWouldBlockException(msg=msg.format(self.sock),
                                            code='PARSE_REQ_SOCK_READ_EXH')
             raise exc from err
 
-        if self.request_receiver.is_finished():
-            error_log.debug3('Received request chunks %s',
-                             self.request_receiver.chunks)
-            lines, leftover_body = self.request_receiver.split_lines()
-            error_log.debug3('Received lines %s with leftover body: %s.',
-                             lines,
-                             leftover_body)
-            try:
-                self.request = ws.http.parser.parse(lines=lines)
-                self.leftover_body = leftover_body
-            except ws.http.parser.ParserException as err:
-                error_log.warning('Parsing error occurred with CODE=%s '
-                                  'and MSG=%s.', err.code, err.msg)
-                self.response = ws.http.utils.build_response(400)
-                return 'parse_failed'
-            else:
-                return 'parse_ok'
+        if not self.request_receiver.is_finished():
+            self.state_machine.transition_to('parsing_request')
+            return
 
-    # noinspection PyUnusedLocal
+        lines, leftover_body = self.request_receiver.split_lines()
+        error_log.debug3('Received lines %s with leftover body: %s.',
+                         lines,
+                         leftover_body)
+        try:
+            self.request = ws.http.parser.parse(lines=lines)
+            self.leftover_body = leftover_body
+        except ws.http.parser.ParserException as err:
+            error_log.warning('Parsing error occurred with CODE=%s '
+                              'and MSG=%s.', err.code, err.msg)
+            self.response = ws.http.utils.build_response(400)
+            self.state_machine.transition_to('reading_response')
+
     def handle_request(self, readable_fds, writable_fds, failed_fds):
         auth_check = self.auth_scheme.check(request=self.request,
                                             address=self.address)
@@ -255,9 +250,7 @@ class HTTPExchange:
                 conn = 'close'
         response.headers['Connection'] = conn
         self.response = response
-        return 'built_response'
 
-    # noinspection PyUnusedLocal
     def read_response(self, readable_fds, writable_fds, failed_fds):
         if not self.response_chunks_iter:
             assert isinstance(self.response, ws.http.structs.HTTPResponse)
@@ -266,34 +259,21 @@ class HTTPExchange:
             self.response_chunk = next(self.response_chunks_iter)
             error_log.debug3('Read chunk %s', self.response_chunk)
         except StopIteration:
-            return 'done_reading'
-        else:
-            return 'read_chunk'
+            self.state_machine.transition_to('cleaning_up')
 
-    # noinspection PyUnusedLocal
     def send_response(self, readable_fds, writable_fds, failed_fds):
         assert isinstance(self.response_chunk, (bytearray, bytes))
         sent = self.sock.send(self.response_chunk)
         error_log.debug3('Sent %s / %s total bytes of current chunk.',
                          sent, len(self.response_chunk))
         self.response_chunk = self.response_chunk[sent:]
-        if self.response_chunk:
-            return 'sent_partial'
-        else:
-            return 'sent_all'
+        if not self.response_chunk:
+            self.state_machine.transition_to('reading_response')
 
     # noinspection PyUnusedLocal
     def cleanup(self, readable_fds, writable_fds, failed_fds):
         access_log.log(request=self.request,
                        response=self.response)
-        return 'done_cleaning'
-
-    def persisted_connection(self):
-        client_persists = self.request and request_is_persistent(self.request)
-        server_persists = (self.response and
-                           response_is_persistent(self.response))
-
-        return client_persists and server_persists
 
 
 def response_iterator(response, chunk_size=4096):

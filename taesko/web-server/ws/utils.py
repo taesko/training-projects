@@ -16,13 +16,14 @@ class StateMachine:
 
     User's can transition to multiple possible states by calling the
     self.transition_to() method from inside a state callback.
-    If an exception is raised from a callback the machine can transition to
+    If an exception is raised from a callback the machine supports transition to
     a default error state.
     See help of __init__ for parameter description and setup.
     """
+    unhandleable_exceptions = (AssertionError, KeyboardInterrupt)
 
-
-    def __init__(self, states, callbacks, initial_state, state_on_exc):
+    def __init__(self, states, callbacks, initial_state, state_on_exc,
+                 allowed_exc_handling):
         """ Setup the state machine - run() needs to be explicitly called.
 
         :param states: A mapping of one state to a sequence of states it can
@@ -31,15 +32,13 @@ class StateMachine:
             state to transition to when self.transition_to() is not explicitly
             called.
         :param callbacks: A mapping between a state and it's callback.
-            States that are not final should not be in here.
+            States that are final MUST NOT be in here.
         :param initial_state: Name of the first state.
-        :param state_on_exc: A mapping to configure exception handling states.
-            It MUST contain a SINGLE key which is the name of the error state.
-            The value must be a dict with two keys who's values are sequences:
-                from: states from which the machine will transition to an error
-                    if an exception is raised.
-                to: states to which the machine can transition after error
-                    handling.
+        :param state_on_exc: Name of an exception handling state.
+        If an exception is raised from inside a callback the machine will
+        set the self.exception variable and transition to this state.
+        :param allowed_exc_handling: Collection of states from which
+        automatic transitioning to state_on_exc is allowed.
         """
         assert isinstance(states, collections.Mapping)
         assert isinstance(callbacks, collections.Mapping)
@@ -48,45 +47,76 @@ class StateMachine:
         assert initial_state in states
         assert state_on_exc in states
 
+        # make shallow copies to guarantee the fields won't be changed
+        # externally.
+        states = {st: tuple(trans) for st, trans in states.items()}
+        callbacks = dict(callbacks)
+        allowed_exc_handling = frozenset(allowed_exc_handling)
+
         for state, allowed_transitions in states.items():
             assert isinstance(state, str)
             for s in allowed_transitions:
                 assert s in states
 
             if not states[state]:
-                assert state not in callbacks
-            if state == initial_state:
-                assert state not in callbacks
-            assert state in callbacks
+                msg = '{} is a final state but has a callback'
+                assert state not in callbacks, msg.format(state)
+            else:
+                assert state in callbacks
 
-            if state not in (initial_state, state_on_exc):
-                for other_state, other_allowed in states.items():
-                    if other_state != state and other_state in other_allowed:
-                        break
-                else:
-                    assert False, 'No transition to {}'.format(state)
+            # TODO algorithm for checking if a graph is walkable from each
+            # node to every other node
+            # if state not in (initial_state, state_on_exc):
+            #     for other_state, other_allowed in states.items():
+            #         if other_state != state and state in other_allowed:
+            #             break
+            #     else:
+            #         assert False, 'No transition to {}'.format(state)
         for state, cb in callbacks.items():
             assert state in states
             assert isinstance(cb, collections.Callable)
+        for state in allowed_exc_handling:
+            assert state != state_on_exc
+            assert state in states
 
         self.states = states
         self.callbacks = callbacks
         self.state_on_exc = state_on_exc
+        self.allowed_exc_handling = allowed_exc_handling
         # below fields need to be reset on every transition.
-        self.state = self.states[initial_state]
+        self.state = initial_state
         self.explicit_transition = None
         self.exception = None
 
     def finished(self):
-        return bool(self.states[self.state])
+        return not bool(self.states[self.state])
 
     def transition_to(self, state):
         assert state in self.states
         self.explicit_transition = state
 
+    def throw(self, exception):
+        if isinstance(exception, self.unhandleable_exceptions):
+            raise exception
+        elif self.state == self.state_on_exc:
+            raise exception
+        elif self.state not in self.allowed_exc_handling:
+            raise exception
+
+        # It's possible to enter an infinite loop here because
+        # a state after error throws an error again.
+        # TODO guarantee this doesn't happen without reducing
+        # flexibility
+        next_state = self.state_on_exc
+        ws.logs.error_log.debug('StateMachine: %s > EXCEPTION > %s',
+                                self.state,
+                                next_state)
+        self.state = next_state
+        self.explicit_transition = None
+        self.exception = exception
+
     def run(self, *args, **kwargs):
         while not self.finished():
-            assert isinstance(self.state, State)
             ws.logs.error_log.debug3('StateMachine: Running %s',
                                      self.state)
             try:
@@ -97,72 +127,20 @@ class StateMachine:
                                          self.state, err.code, err.msg)
                 break
             except BaseException as err:
-                if self.state == self.state_on_exc:
-                    raise
-                # It's possible to enter an infinite loop here because
-                # a state after error throws an error again.
-                # TODO guarantee this doesn't happen without reducing
-                # flexibility
-                next_state = self.state_on_exc
-                ws.logs.error_log.debug('StateMachine: %s > EXCEPTION > %s',
-                                        self.state,
-                                        next_state)
-                self.state = next_state
-                self.explicit_transition = None
-                self.exception = err
+                self.throw(err)
             else:
                 if self.explicit_transition:
                     transition = self.explicit_transition
                 else:
-                    transition = next(self.states[self.state])
-                next_state = self.states[transition.next]
-                ws.logs.error_log.debug2('StateMachine: %s ~ %s > %s',
+                    transition = self.states[self.state][0]
+                ws.logs.error_log.debug2('StateMachine: %s > %s',
                                          self.state,
-                                         transition,
-                                         next_state)
-                self.state = next_state
+                                         transition)
+                self.state = transition
                 self.explicit_transition = None
                 self.exception = None
         else:
             ws.logs.error_log.debug('StateMachine: %s is FINAL.', self.state)
-
-
-class State:
-    def __init__(self, name, final, callback, transitions=None,
-                 on_exception=None):
-        assert isinstance(name, str)
-        assert isinstance(final, bool)
-        if final:
-            assert not callback
-            assert not transitions
-        else:
-            assert isinstance(callback, collections.Callable)
-            assert transitions
-        self.name = name
-        self.final = final
-        self.callback = callback
-        self.on_exception = on_exception
-        if transitions:
-            self.transitions = []
-            for trans_name, next_state in transitions.items():
-                t = Transition(name=trans_name, next=next_state)
-                self.transitions.append(t)
-        else:
-            self.transitions = []
-
-    def __str__(self):
-        return 'State<{self.name}>'.format(self=self)
-
-
-class Transition:
-    def __init__(self, name, next):
-        assert isinstance(name, str)
-        assert isinstance(next, str)
-        self.name = name
-        self.next = next
-
-    def __str__(self):
-        return 'Transition<{self.name}>'.format(self=self)
 
 
 def depreciated(log=ws.logs.error_log):
