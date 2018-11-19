@@ -58,6 +58,9 @@ class ConnectionWorker:
             persist_connection=self.persist_connection
         )
 
+    def select_fds(self):
+        pass
+
     def process(self, readable_fds, writable_fds, failed_fds):
         if not self.exchanges:
             self.exchanges.append(self.make_new_exchange())
@@ -73,9 +76,9 @@ class ConnectionWorker:
             else:
                 assert False
 
-        self.exchanges[-1].state_machine.run(readable_fds=readable_fds,
-                                             writable_fds=writable_fds,
-                                             failed_fds=failed_fds)
+        return self.exchanges[-1].run(readable_fds=readable_fds,
+                                      writable_fds=writable_fds,
+                                      failed_fds=failed_fds)
 
 
 class HTTPExchange:
@@ -100,7 +103,7 @@ class HTTPExchange:
                 'sending_response': ('sending_response', 'reading_response'),
                 'cleaning_up': ('done',),
                 'done': (),
-                'failed': ('sending_response', )
+                'failed': ('sending_response',)
             },
             callbacks={
                 'parsing_request': self.parse_request,
@@ -131,26 +134,24 @@ class HTTPExchange:
         self.static_files = static_files
         self.worker_stats = worker_stats
 
-        self.read_fds = []
-        self.write_fds = []
+        self.read_fds = {self.sock.fileno()}
+        self.write_fds = {self.sock.fileno()}
 
-    def run(self, readable_fds, writable_fds, failed_fds):
-        if self.sock.fileno() in failed_fds:
-            exc = BrokenSocketException(msg='Connection %s / %s broke.'
-                                        .format(self.sock, self.address),
-                                        code='EXCHANGE_SOCKET_FD_FAILED')
-            self.state_machine.throw(exc)
-            self.state_machine.run()
+    def missing_fds(self, readable_fds, writable_fds, failed_fds):
         all_fds = (*self.read_fds, *self.write_fds)
         failed = any(fd in failed_fds for fd in all_fds)
-        can_read = all(fd in readable_fds for fd in self.read_fds)
-        can_write = all(fd in writable_fds for fd in self.write_fds)
-        elif self.can_do_io(readable_fds, writable_fds, failed_fds):
-            self.state_machine.run()
+        can_read = set(fd in readable_fds for fd in self.read_fds)
+        can_write = set(fd in writable_fds for fd in self.write_fds)
+        if failed:
+            raise BrokenSocketException(msg='Connection %s / %s broke.'
+                                        .format(self.sock, self.address),
+                                        code='EXCHANGE_SOCKET_FD_FAILED')
+        elif can_read == self.read_fds and can_write == self.write_fds:
+            return set(), set()
+        else:
+            return self.read_fds - can_read, self.write_fds - can_write
 
-    def fail_on_dropped_socket(self, method):
-        def wrapped(*args, **kwargs):
-            if
+
     def persisted_connection(self):
         client_persists = self.request and request_is_persistent(self.request)
         server_persists = (self.response and
@@ -159,17 +160,18 @@ class HTTPExchange:
         return client_persists and server_persists
 
     def build_error_response(self):
+        self.read_fds = set()
+        self.write_fds = {self.sock.fileno()}
         error_log.error('Exception occurred during processing of request '
                         'on connection %s / %s. Sending a 500 to client.',
                         self.sock, self.address,
                         exc_info=self.state_machine.exception)
         self.response = ws.http.utils.build_response(500)
 
-    def parse_request(self, readable_fds, writable_fds, failed_fds):
-        if self.sock.fileno() not in readable_fds:
-            raise StateWouldBlockException(msg='Cannot read from socket {}.'
-                                           .format(self.sock),
-                                           code='PARSE_REQ_SOCK_BLOCKS')
+    def parse_request(self):
+        self.read_fds = {self.sock.fileno()}
+        self.write_fds = set()
+
         try:
             while not self.request_receiver.is_finished():
                 self.request_receiver.do_recv()
@@ -201,7 +203,9 @@ class HTTPExchange:
             self.response = ws.http.utils.build_response(400)
             self.state_machine.transition_to('reading_response')
 
-    def handle_request(self, readable_fds, writable_fds, failed_fds):
+    def handle_request(self):
+        self.read_fds = set()
+        self.write_fds = set()
         auth_check = self.auth_scheme.check(request=self.request,
                                             address=self.address)
         is_authorized, auth_response = auth_check
@@ -251,7 +255,10 @@ class HTTPExchange:
         response.headers['Connection'] = conn
         self.response = response
 
-    def read_response(self, readable_fds, writable_fds, failed_fds):
+    def read_response(self):
+        self.read_fds = set()
+        self.write_fds = set()
+
         if not self.response_chunks_iter:
             assert isinstance(self.response, ws.http.structs.HTTPResponse)
             self.response_chunks_iter = response_iterator(self.response)
@@ -261,8 +268,11 @@ class HTTPExchange:
         except StopIteration:
             self.state_machine.transition_to('cleaning_up')
 
-    def send_response(self, readable_fds, writable_fds, failed_fds):
+    def send_response(self):
         assert isinstance(self.response_chunk, (bytearray, bytes))
+        self.read_fds = set()
+        self.write_fds = {self.sock.fileno()}
+
         sent = self.sock.send(self.response_chunk)
         error_log.debug3('Sent %s / %s total bytes of current chunk.',
                          sent, len(self.response_chunk))
@@ -272,6 +282,9 @@ class HTTPExchange:
 
     # noinspection PyUnusedLocal
     def cleanup(self, readable_fds, writable_fds, failed_fds):
+        self.read_fds = set()
+        self.write_fds = set()
+
         access_log.log(request=self.request,
                        response=self.response)
 

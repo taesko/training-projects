@@ -20,7 +20,6 @@ class StateMachine:
     a default error state.
     See help of __init__ for parameter description and setup.
     """
-    unhandleable_exceptions = (AssertionError, KeyboardInterrupt)
 
     def __init__(self, states, callbacks, initial_state, state_on_exc,
                  allowed_exc_handling):
@@ -116,31 +115,34 @@ class StateMachine:
         self.exception = exception
 
     def run(self, *args, **kwargs):
-        while not self.finished():
-            ws.logs.error_log.debug3('StateMachine: Running %s',
-                                     self.state)
-            try:
-                self.callbacks[self.state](*args, **kwargs)
-            except StateWouldBlockException as err:
-                ws.logs.error_log.debug3('StateMachine: %s would block. '
-                                         'CODE=%s MSG=%s',
-                                         self.state, err.code, err.msg)
-                break
-            except BaseException as err:
-                self.throw(err)
-            else:
-                if self.explicit_transition:
-                    transition = self.explicit_transition
-                else:
-                    transition = self.states[self.state][0]
-                ws.logs.error_log.debug2('StateMachine: %s > %s',
-                                         self.state,
-                                         transition)
-                self.state = transition
-                self.explicit_transition = None
-                self.exception = None
+        assert not self.finished()
+        ws.logs.error_log.debug3('StateMachine: Running %s',
+                                 self.state)
+        try:
+            result = self.callbacks[self.state](*args, **kwargs)
+        except StateWouldBlockException:
+            raise
+        except BaseException as err:
+            next_state = self.state_on_exc
+            ws.logs.error_log.debug('StateMachine: %s > EXCEPTION > %s',
+                                    self.state,
+                                    next_state)
+            self.state = next_state
+            self.explicit_transition = None
+            self.exception = err
+            raise
         else:
-            ws.logs.error_log.debug('StateMachine: %s is FINAL.', self.state)
+            if self.explicit_transition:
+                transition = self.explicit_transition
+            else:
+                transition = self.states[self.state][0]
+            ws.logs.error_log.debug2('StateMachine: %s > %s',
+                                     self.state,
+                                     transition)
+            self.state = transition
+            self.explicit_transition = None
+            self.exception = None
+            return result
 
 
 def depreciated(log=ws.logs.error_log):

@@ -40,6 +40,8 @@ class Worker:
         else:
             self.ssl_ctx = None
 
+        self.select_args = [{self.fd_transport.fileno()}, set(), set()]
+
     def recv_new_sockets(self):
         """ Receives new sockets from the parent process.
 
@@ -90,6 +92,9 @@ class Worker:
             # TODO connection_workers is a horrible name
             connected_sockets = tuple(conn[0].fileno() for conn in
                                       self.connection_workers.keys())
+            # for conn_worker in self.connection_workers:
+            #     r, w = conn_worker.select_fds()
+            #     self.select_args
             rlist = connected_sockets + (self.fd_transport.fileno(),)
             wlist = connected_sockets
             xlist = []  # TODO wat ?
@@ -193,3 +198,36 @@ class Worker:
                                            static_files=self.static_files,
                                            worker_stats={},
                                            persist_connection=True)
+
+
+class IOLoop:
+    def __init__(self):
+        self.channels = {}
+        self.read_fds = {}
+        self.write_fds = {}
+
+    def poll(self):
+        while True:
+            pass
+
+    def subscribe(self, key, callback, read_fds, write_fds):
+        assert key not in self.channels
+        channel_read_fds = {}
+        channel_write_fds = {}
+        for fd in read_fds:
+            assert fd not in self.read_fds
+            self.read_fds[fd] = key
+            channel_read_fds[fd] = False
+        for fd in write_fds:
+            assert fd not in self.write_fds
+            self.write_fds[fd] = key
+            channel_write_fds[fd] = True
+
+
+    def unsubscribe(self, key):
+        assert key in self.channels
+        read_fds, write_fds, cb = self.channels.pop(key)
+        for fd in self.read_fds:
+            del read_fds[fd]
+        for fd in self.write_fds:
+            del write_fds[fd]
